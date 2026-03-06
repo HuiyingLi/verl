@@ -23,13 +23,13 @@ from ray.actor import ActorHandle
 from ray.util import placement_group_table
 from ray.util.placement_group import PlacementGroup
 
-from verl.single_controller.ray import RayClassWithInitArgs, SubRayResourcePool
+from verl.single_controller.ray import SubRayResourcePool
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.trtllm_rollout.trtllm_rollout import ServerAdapter
-from verl.workers.rollout.utils import get_max_position_embeddings, run_unvicorn
+from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -84,6 +84,8 @@ class TRTLLMHttpServer:
         self.max_colocate_count = max_colocate_count
         self.pgs = pgs
         self.bundle_indices = bundle_indices
+        # model weights version, set by ServerAdapter when update weights.
+        self.global_steps = None
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
             logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
@@ -172,14 +174,14 @@ class TRTLLMHttpServer:
         self.llm = await AsyncLLM(**llm_kwargs)
 
         trtllm_server = OpenAIServer(
-            llm=self.llm,
+            generator=self.llm,
             model=self.model_config.local_path,
             tool_parser=None,
             server_role=None,
             metadata_server_cfg=None,
         )
         app = trtllm_server.app
-        self._server_port, self._server_task = await run_unvicorn(app, None, self._server_address)
+        self._server_port, self._server_task = await run_uvicorn(app, None, self._server_address)
 
     async def generate(
         self,
@@ -211,7 +213,17 @@ class TRTLLMHttpServer:
         log_probs = None
         if trt_llm_sampling_params.logprobs is not None:
             log_probs = [list(d.values())[0].logprob for d in outputs.outputs[0].logprobs]
-        return TokenOutput(token_ids=token_ids, log_probs=log_probs)
+        return TokenOutput(token_ids=token_ids, log_probs=log_probs, extra_info={"global_steps": self.global_steps})
+
+    async def set_global_steps(self, global_steps: int):
+        """Set the global steps of the model weights."""
+        self.global_steps = global_steps
+
+    async def abort_all_requests(self):
+        raise NotImplementedError
+
+    async def resume_generation(self):
+        raise NotImplementedError
 
     async def wake_up(self):
         if self.rollout_mode == RolloutMode.HYBRID:
@@ -241,9 +253,6 @@ class TRTLLMHttpServer:
         )
 
 
-_rollout_worker_actor_cls = ray.remote(ServerAdapter)
-
-
 class TRTLLMReplica(RolloutReplica):
     def __init__(
         self,
@@ -255,17 +264,6 @@ class TRTLLMReplica(RolloutReplica):
     ) -> None:
         super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
         self.node_ip = ray.util.get_node_ip_address().strip("[]")
-
-    def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
-        """Get rollout worker actor class for colocated and standalone mode."""
-        worker_dict_cls = RayClassWithInitArgs(
-            cls=_rollout_worker_actor_cls,
-            config=self.config,
-            model_config=self.model_config,
-            device_mesh=None,
-            replica_rank=self.replica_rank,
-        )
-        return worker_dict_cls
 
     def rollout_worker_use_gpu(self) -> bool:
         return False
@@ -353,6 +351,7 @@ class TRTLLMReplica(RolloutReplica):
             ),
             runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}},
             name=name,
+            max_concurrency=self.max_concurrency,
         ).remote(
             config=self.config,
             model_config=self.model_config,
