@@ -200,8 +200,15 @@ class AutomodelOptimizerConfig(OptimizerConfig):
     lr_scheduler_type: str = "cosine"
     wd_incr_style: str = "constant"
     num_cycles: float = 0.5
-    override_optimizer_config: Optional[dict] = None
     zero_indexed_step: bool = True
+    # Common optimizer kwargs
+    eps: float = 1e-8
+    master_weights: bool = False
+    store_param_remainders: bool = False
+    exp_avg_dtype: Optional[str] = None  # "fp32", "bf16", "fp16", or "torch.float32" etc.
+    exp_avg_sq_dtype: Optional[str] = None  # "fp32", "bf16", "fp16", or "torch.float32" etc.
+    master_weight_dtype: Optional[str] = None  # "fp32", "bf16", "fp16", or "torch.float32" etc.
+    override_optimizer_config: Optional[dict] = None
 
     def __post_init__(self):
         assert self.lr_scheduler_type in ["constant", "cosine", "linear", "inverse-square-root"]

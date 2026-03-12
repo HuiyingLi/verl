@@ -89,6 +89,13 @@ class AutomodelEngine(BaseEngine):
         self.mode = None
         self.rank = torch.distributed.get_rank()
 
+        # Apply compatibility patches early in the process
+        from nemo_automodel._transformers.utils import apply_cache_compatibility_patches
+        from nemo_automodel.shared.te_patches import apply_te_patches
+
+        apply_cache_compatibility_patches()
+        apply_te_patches()
+
         world_size = torch.distributed.get_world_size()
         self.distributed_config, self.device_mesh, self.moe_mesh = build_distributed_config_from_engine_config(
             self.engine_config, world_size
@@ -144,12 +151,43 @@ class AutomodelEngine(BaseEngine):
         )
 
         log_gpu_memory_usage("After offload model/optimizer/grad during init", logger=logger)
+        torch.cuda.empty_cache()
 
     def _build_optimizer(self, module):
-        from verl.workers.config.optimizer import build_optimizer
+        """Build optimizer via Automodel's build_optimizer."""
+        from nemo_automodel.components.config.loader import ConfigNode
+        from nemo_automodel.recipes.llm.train_ft import build_optimizer as automodel_build_optimizer
 
-        trainable_params = [p for p in module.parameters() if p.requires_grad]
-        return build_optimizer(trainable_params, self.optimizer_config)
+        config = self.optimizer_config
+
+        opt_dict = {
+            "_target_": f"{config.optimizer_impl}.{config.optimizer}",
+            "lr": config.lr,
+            "weight_decay": config.weight_decay,
+            "eps": config.eps,
+            "betas": list(config.betas),
+        }
+
+        if config.master_weights:
+            opt_dict["master_weights"] = config.master_weights
+        if config.store_param_remainders:
+            opt_dict["store_param_remainders"] = config.store_param_remainders
+
+        _short_to_torch = {"bf16": "torch.bfloat16", "fp32": "torch.float32", "fp16": "torch.float16"}
+        for attr in ("exp_avg_dtype", "exp_avg_sq_dtype", "master_weight_dtype"):
+            val = getattr(config, attr, None)
+            if val is not None:
+                opt_dict[attr] = _short_to_torch.get(val, val)
+
+        if config.override_optimizer_config:
+            opt_dict.update(config.override_optimizer_config)
+
+        cfg_opt = ConfigNode(opt_dict)
+        optimizers = automodel_build_optimizer(
+            module, cfg_opt, self.distributed_config, self.device_mesh
+        )
+        assert len(optimizers) == 1, f"Expected 1 optimizer, got {len(optimizers)}"
+        return optimizers[0]
 
     def _build_lr_scheduler(self, optimizer):
         cfg = self.optimizer_config
@@ -202,6 +240,14 @@ class AutomodelEngine(BaseEngine):
 
         if not forward_only:
             prepare_for_grad_accumulation([self.module])
+
+            # Set MoE aux loss backward scale to counteract FSDP's gradient allreduce.
+            if self.engine_config.ep_size > 1:
+                from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
+
+                MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
+                    float(get_dp_group_size(self.device_mesh, include_cp=True))
+                )
 
         num_micro_batches = len(micro_batches)
         for i, micro_batch in enumerate(micro_batches):

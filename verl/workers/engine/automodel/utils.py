@@ -151,7 +151,7 @@ def build_automodel_model(model_config, engine_config, distributed_config, devic
 
         kwargs["compile_config"] = CompileConfig()
 
-    # Force use of HF model implementation for Qwen/Llama models.
+    # Qwen/Llama with ep_size<=1: use HF implementation.
     from transformers import AutoConfig
 
     _cfg = AutoConfig.from_pretrained(model_config.path, trust_remote_code=model_config.trust_remote_code)
@@ -159,34 +159,21 @@ def build_automodel_model(model_config, engine_config, distributed_config, devic
     if engine_config.ep_size <= 1 and ("qwen" in _arch or "llama" in _arch):
         kwargs["force_hf"] = True
 
-    # Create MoE BackendConfig
-    if engine_config.use_te_backend or engine_config.ep_size > 1:
+    if engine_config.backend_config and not kwargs.get("force_hf", False):
         from nemo_automodel.components.models.common.utils import BackendConfig
 
-        backend_config = BackendConfig(
-            attn="te" if engine_config.use_te_backend else engine_config.attn_implementation,
-            linear="te" if engine_config.use_te_backend else "torch",
-            rms_norm="te" if engine_config.use_te_backend else "torch",
-            rope_fusion=engine_config.rope_fusion,
-            enable_deepep=engine_config.enable_deepep,
-            fake_balanced_gate=engine_config.fake_balanced_gate,
-            gate_precision=engine_config.gate_precision,
-            enable_hf_state_dict_adapter=engine_config.enable_hf_state_dict_adapter,
-            enable_fsdp_optimizations=engine_config.enable_fsdp_optimizations,
-            experts=engine_config.experts_backend,
-        )
-        kwargs["backend"] = backend_config
+        backend_kwargs = dict(engine_config.backend_config)
+        kwargs["backend"] = BackendConfig(**backend_kwargs)
 
-    # MoE config for EP
+    # MoE config for MoEParallelizerConfig
     if engine_config.ep_size > 1:
         from nemo_automodel.components.moe.config import MoEParallelizerConfig
 
-        kwargs["moe_config"] = MoEParallelizerConfig(
-            ignore_router_for_ac=engine_config.ignore_router_for_ac,
-            reshard_after_forward=engine_config.reshard_after_forward,
-            lm_head_precision=engine_config.lm_head_precision,
-            wrap_outer_model=engine_config.wrap_outer_model,
-        )
+        moe_kwargs = dict(engine_config.moe_config) if engine_config.moe_config else {}
+        if hasattr(distributed_config, "mp_policy"):
+            moe_kwargs.setdefault("mp_policy", distributed_config.mp_policy)
+
+        kwargs["moe_config"] = MoEParallelizerConfig(**moe_kwargs)
 
     kwargs["attn_implementation"] = engine_config.attn_implementation
 
@@ -209,10 +196,7 @@ def build_automodel_model(model_config, engine_config, distributed_config, devic
 
 @torch.no_grad()
 def offload_automodel_model_to_cpu(model, empty_cache=True):
-    """Offload an FSDP2-wrapped model to CPU.
-
-    Same pattern as VeOmni's offload_veomni_model_to_cpu.
-    """
+    """Offload an FSDP2-wrapped model to CPU (reshard, move to CPU, optional cache clear)."""
     from torch.distributed.fsdp._fully_shard._fsdp_common import TrainingState
     from torch.distributed.fsdp._fully_shard._fsdp_state import _get_module_fsdp_state
 
@@ -237,7 +221,7 @@ def offload_automodel_model_to_cpu(model, empty_cache=True):
 def load_automodel_model_to_gpu(model):
     """Load model back to GPU."""
     device = get_device_id()
-    model.to(device)
+    model.to(device, non_blocking=True)
 
 
 @torch.no_grad()

@@ -423,19 +423,51 @@ class AutomodelEngineConfig(EngineConfig):
         attn_implementation (str): Attention implementation to use ("sdpa", "flash_attention_2", "eager", "te").
 
     Backend settings (nemo_automodel BackendConfig):
-        use_te_backend (bool): Use TransformerEngine attn/linear/rms_norm.
-        rope_fusion (bool): Enable RoPE fusion (requires TransformerEngine).
-        gate_precision (Optional[str]): Precision for MoE gate/router weights (e.g. "fp32", "bf16").
-        enable_hf_state_dict_adapter (bool): Enable HuggingFace state dict compatibility.
-        enable_fsdp_optimizations (bool): Enable FSDP-specific optimizations in TE layers.
+        backend_config (dict): Dict of kwargs passed directly to
+            nemo_automodel.components.models.common.BackendConfig(**backend_config).
+            Controls how model layers are implemented (TE vs PyTorch) and MoE dispatch.
+            See automodel.yaml for all predefined keys with defaults.
+            Key fields:
+                attn (str): Attention backend. "te" = TransformerEngine fused attention,
+                    "sdpa" = PyTorch scaled dot-product attention. Default: "sdpa".
+                linear (str): Linear layer backend. "te" = TE fused linear (with FP8 support),
+                    "torch" = standard PyTorch linear. Default: "te".
+                rms_norm (str): RMSNorm backend. "te" = TE fused RMSNorm, "torch" = PyTorch,
+                    "torch_fp32" = PyTorch in FP32 (better numerical stability for MoE).
+                    Default: "torch_fp32".
+                rope_fusion (bool): Enable fused RoPE kernel (requires CP=1). Default: true.
+                experts (str): MoE expert computation backend.
+                    "gmm" = grouped_gemm (requires pip install grouped_gemm),
+                    "torch_mm" = torch._grouped_mm (no external dependency),
+                    "te" = TE GroupedLinear. Default: "gmm".
+                dispatcher (str): MoE token dispatch strategy.
+                    "torch" = standard all-gather + local compute,
+                    "deepep" = DeepEP optimized all-to-all (higher throughput).
+                    Default: "torch".
+                    Note: "deepep" with experts="gmm" matches the legacy enable_deepep=True behavior.
+                enable_fsdp_optimizations (bool): Enable FSDP-specific optimizations in Automodel.
+                    Default: false.
+                enable_hf_state_dict_adapter (bool): Enable HuggingFace state dict adapter for
+                    checkpoint compatibility. Default: true.
+                fake_balanced_gate (bool): Use fake balanced gating for debugging. Default: false.
+                fake_gate_noise (float): Noise added to fake balanced gate. Default: 0.0.
+                gate_precision: Gate computation precision. Default: null (auto).
+            Full reference: nemo_automodel/components/models/common/backend_config.py
 
     MoE / Expert Parallelism settings:
-        enable_deepep (bool): Enable DeepEP for distributed expert parallelism.
-        reshard_after_forward (bool): Reshard parameters after forward pass in MoE parallelizer.
-        fake_balanced_gate (bool): Use balanced gate for performance analysis.
-        ignore_router_for_ac (bool): Use selective activation checkpointing that saves router outputs.
-        lm_head_precision (Optional[str]): Custom precision for lm_head layer (e.g. "fp32").
-        wrap_outer_model (bool): Wrap outer model in FSDP if it differs from inner model.
+        moe_config (dict): Dict of kwargs passed directly to
+            nemo_automodel.components.moe.parallelizer.MoEParallelizerConfig(**moe_config).
+            Controls MoE parallelization behavior within FSDP2.
+            See automodel.yaml for all predefined keys with defaults.
+            Key fields:
+                ignore_router_for_ac (bool): Exclude router from activation checkpointing.
+                    Default: false.
+                reshard_after_forward (bool): Reshard expert params after forward pass
+                    (trades compute for memory). Default: false.
+                lm_head_precision: Precision for the LM head. Default: null (auto).
+                wrap_outer_model (bool): Whether to FSDP-wrap the outermost model module.
+                    Default: true.
+            Full reference: nemo_automodel/components/moe/parallelizer.py
 
     Mixed precision policy (FSDP2):
         mp_param_dtype (str): Parameter dtype for FSDP2 mixed precision policy.
@@ -464,20 +496,10 @@ class AutomodelEngineConfig(EngineConfig):
     enable_compile: bool = False
     model_dtype: str = "fp32"
     attn_implementation: str = "flash_attention_2"
-    # Backend settings (BackendConfig)
-    use_te_backend: bool = False
-    rope_fusion: bool = True
-    gate_precision: Optional[str] = None
-    enable_hf_state_dict_adapter: bool = True
-    enable_fsdp_optimizations: bool = False
-    # MoE / Expert Parallelism settings
-    enable_deepep: bool = False
-    reshard_after_forward: bool = False
-    fake_balanced_gate: bool = False
-    experts_backend: str = "gmm"  # "gmm" (grouped_gemm) or "torch_mm" (torch._grouped_mm)
-    ignore_router_for_ac: bool = False
-    lm_head_precision: Optional[str] = None
-    wrap_outer_model: bool = True
+    # Backend settings
+    backend_config: dict = field(default_factory=dict)
+    # MoE settings
+    moe_config: dict = field(default_factory=dict)
     # Mixed precision policy
     mp_param_dtype: str = "bf16"
     mp_reduce_dtype: str = "fp32"

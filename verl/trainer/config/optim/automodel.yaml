@@ -44,4 +44,13 @@ wd_incr_style: constant
 num_cycles: 0.5
 zero_indexed_step: true
 
+# Common optimizer kwargs
+eps: 1e-8
+master_weights: false
+store_param_remainders: false
+exp_avg_dtype: null       # "fp32", "bf16"
+exp_avg_sq_dtype: null    # "fp32", "bf16"
+master_weight_dtype: null # "fp32", "bf16"
+
+# Additional optimizer kwargs (passed directly to constructor)
 override_optimizer_config: {}
