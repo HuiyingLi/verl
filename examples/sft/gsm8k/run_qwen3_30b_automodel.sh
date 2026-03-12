@@ -1,4 +1,4 @@
-# Requires: Automodel r0.3.0 and transformers v5.0.0
+# Requires: transformers v5.3.0
 
 set -x
 
@@ -36,23 +36,31 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     engine.pp_size=1 \
     engine.cp_size=1 \
     engine.ep_size=8 \
-    engine.enable_deepep=True \
-    engine.use_te_backend=True \
-    engine.enable_fsdp_optimizations=True \
-    engine.activation_checkpointing=False \
+    engine.backend_config.dispatcher=deepep \
+    engine.backend_config.attn=te \
+    engine.backend_config.linear=te \
+    engine.backend_config.rms_norm=torch_fp32 \
+    engine.backend_config.enable_fsdp_optimizations=True \
+    engine.backend_config.experts=torch_mm \
+    engine.activation_checkpointing=True \
     engine.model_dtype=bf16 \
     engine.attn_implementation=te \
     engine.use_torch_compile=False \
-    engine.experts_backend=torch_mm \
     optim=automodel \
+    optim.optimizer=FusedAdam \
+    optim.optimizer_impl=transformer_engine.pytorch.optimizers.fused_adam \
     optim.lr=1e-5 \
     optim.lr_warmup_steps_ratio=0.1 \
-    optim.weight_decay=0.01 \
+    optim.weight_decay=0 \
     optim.betas='[0.9,0.95]' \
     optim.clip_grad=1.0 \
     optim.init_lr_ratio=0.1 \
     optim.min_lr_ratio=0.01 \
     optim.lr_scheduler_type=cosine \
+    optim.master_weights=true \
+    optim.store_param_remainders=true \
+    optim.exp_avg_dtype=bf16 \
+    optim.exp_avg_sq_dtype=bf16 \
     trainer.default_local_dir=$save_path \
     trainer.project_name=hellaswag-sft \
     trainer.experiment_name=hellaswag-sft-qwen3-30b-automodel \

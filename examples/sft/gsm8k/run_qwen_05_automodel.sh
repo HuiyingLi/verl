@@ -1,4 +1,4 @@
-# Requires: Automodel r0.3.0 and transformers v5.0.0
+# Requires: transformers v5.3.0
 
 set -x
 
