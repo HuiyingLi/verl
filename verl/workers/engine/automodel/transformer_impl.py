@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 
 import torch
 import torch.distributed
+from huggingface_hub.constants import HF_HUB_CACHE
 from nemo_automodel.components.checkpoint.checkpointing import Checkpointer, CheckpointingConfig
 from nemo_automodel.components.optim.scheduler import OptimizerParamScheduler
 from nemo_automodel.components.training.utils import (
@@ -36,7 +37,6 @@ from nemo_automodel.components.training.utils import (
 )
 from tensordict import TensorDict
 from torch.distributed.tensor import DTensor
-from huggingface_hub.constants import HF_HUB_CACHE
 
 import verl.utils.torch_functional as verl_F
 from verl.trainer.config import CheckpointConfig
@@ -183,9 +183,7 @@ class AutomodelEngine(BaseEngine):
             opt_dict.update(config.override_optimizer_config)
 
         cfg_opt = ConfigNode(opt_dict)
-        optimizers = automodel_build_optimizer(
-            module, cfg_opt, self.distributed_config, self.device_mesh
-        )
+        optimizers = automodel_build_optimizer(module, cfg_opt, self.distributed_config, self.device_mesh)
         assert len(optimizers) == 1, f"Expected 1 optimizer, got {len(optimizers)}"
         return optimizers[0]
 
@@ -251,7 +249,7 @@ class AutomodelEngine(BaseEngine):
 
         num_micro_batches = len(micro_batches)
         for i, micro_batch in enumerate(micro_batches):
-            # Signal final backward for MoE 
+            # Signal final backward for MoE
             if not forward_only and i == num_micro_batches - 1:
                 prepare_for_final_backward([self.module])
 
