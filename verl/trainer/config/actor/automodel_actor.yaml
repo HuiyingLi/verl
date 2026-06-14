@@ -1,0 +1,10 @@
+# automodel actor config (nemo_automodel tinker Engine), inheriting from actor.yaml
+defaults:
+  - ../optim@optim: automodel
+  - ../engine@automodel: automodel
+  - actor
+  - _self_
+
+_target_: verl.workers.config.AutomodelActorConfig
+
+strategy: automodel

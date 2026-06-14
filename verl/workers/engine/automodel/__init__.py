@@ -12,9 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .transformer_impl import AutomodelEngine, AutomodelEngineWithLMHead
+# Redone automodel engine (current nemo_automodel + tinker Engine).
+from .engine_tinker_impl import AutomodelEngine
 
-__all__ = [
-    "AutomodelEngine",
-    "AutomodelEngineWithLMHead",
-]
+__all__ = ["AutomodelEngine"]
