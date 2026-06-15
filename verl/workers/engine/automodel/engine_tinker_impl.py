@@ -16,7 +16,7 @@
 Standalone ``BaseEngine`` implementation (does not depend on the legacy
 automodel engine). It builds the model with the current Automodel API
 (``build_model`` + ``create_distributed_setup_from_config``) and delegates the
-training step to ``nemo_automodel.engine.Engine`` via its ``PackedBatch``
+training step to ``nemo_automodel.components.training.engine.Engine`` via its ``PackedBatch``
 pass-through door: the Engine owns the microbatch lifecycle, forward, per-datum
 logprob extraction, gradient clipping and the optimizer step. verl keeps its
 data layout (THD remove-padding) and its loss functions; a thin bridge maps the
@@ -28,7 +28,7 @@ from contextlib import nullcontext
 import torch
 
 from nemo_automodel.components.datasets.datum import PackedBatch
-from nemo_automodel.engine import Engine
+from nemo_automodel.components.training.engine import Engine
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -95,6 +95,14 @@ class AutomodelEngine(BaseEngine):
                 "pretrained_model_name_or_path": self.model_config.path,
                 "trust_remote_code": getattr(self.model_config, "trust_remote_code", False),
                 "attn_implementation": ec.attn_implementation,
+                # Disable fused TE RoPE: the fused kernel indexes rotary angles by
+                # physical sequence position and assumes contiguous [0, seq_len)
+                # positions, so it does NOT honor the per-sequence position_id resets
+                # of a THD-packed batch. With packed GRPO micro-batches that silently
+                # corrupts RoPE for every non-first sequence in a pack (logprobs drift
+                # vs the vLLM rollout, breaking the importance ratio). The non-fused
+                # path gathers cos/sin by position_id value and is packing-correct.
+                "backend": {"rope_fusion": False},
             }
         )
         self.module = build_model(model_cfg, None, seed=ec.seed, distributed_setup=dist_setup)
