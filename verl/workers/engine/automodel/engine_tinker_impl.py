@@ -23,8 +23,6 @@ data layout (THD remove-padding) and its loss functions; a thin bridge maps the
 Engine's per-datum ``ModelOutput`` back to verl's flat ``model_output["log_probs"]``.
 """
 
-from contextlib import nullcontext
-
 import torch
 
 from nemo_automodel.components.datasets.datum import PackedBatch
@@ -34,7 +32,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.device import get_device_id
 
-from ..base import BaseEngine, EngineRegistry
+from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
 from ..utils import postprocess_batch_func, prepare_micro_batches
 
 
@@ -252,26 +250,47 @@ class AutomodelEngine(BaseEngine):
         return self._engine.disable_adapter()
 
     def train_mode(self, **kwargs):
-        return _ModeCtx(self, "train")
+        return EngineTrainModeCtx(self, **kwargs)
 
     def eval_mode(self, **kwargs):
-        return _ModeCtx(self, "eval")
+        return EngineEvalModeCtx(self, **kwargs)
 
 
-class _ModeCtx:
-    """Minimal train/eval context (sets module mode; offload omitted for now)."""
+class EngineEvalModeCtx(BaseEngineCtx):
+    """Eval context. ``BaseEngineCtx`` drives parameter onload (enter) / offload
+    (exit) — gated by ``is_param_offload_enabled`` and ``disable_auto_offload``,
+    so it is a no-op when offload is disabled (params stay resident). We add the
+    per-part ``eval()`` switch. Mirrors fsdp/megatron/torchtitan/veomni, which all
+    subclass ``BaseEngineCtx`` and only add the train/eval toggle.
+    """
 
-    def __init__(self, engine: AutomodelEngine, mode: str):
-        self.engine = engine
-        self.mode = mode
-        self._inner = nullcontext()
+    def __init__(self, engine: AutomodelEngine, **kwargs):
+        super().__init__(engine=engine, mode="eval", **kwargs)
 
     def __enter__(self):
-        self.engine.mode = self.mode
-        for p in self.engine._engine.model_parts:
-            p.train(self.mode == "train")
-        return self._inner.__enter__()
+        super().__enter__()  # onload (if param_offload) + set engine.mode
+        for part in self.engine._engine.model_parts:
+            part.eval()
 
-    def __exit__(self, *exc):
-        self.engine.mode = None
-        return self._inner.__exit__(*exc)
+    def __exit__(self, exc_type, exc_value, traceback):
+        super().__exit__(exc_type, exc_value, traceback)  # offload model to CPU (if param_offload)
+
+
+class EngineTrainModeCtx(BaseEngineCtx):
+    """Train context. ``BaseEngineCtx`` onloads model (+optimizer/grad) on enter
+    and offloads on exit, gated by ``is_param_offload_enabled`` /
+    ``is_optimizer_offload_enabled``. We add the per-part ``train()`` switch and
+    zero grads before offload (so no grad tensors are stranded on either device).
+    """
+
+    def __init__(self, engine: AutomodelEngine, **kwargs):
+        super().__init__(engine=engine, mode="train", **kwargs)
+
+    def __enter__(self):
+        super().__enter__()  # onload model (+ optimizer/grad if their offload is enabled) + set mode
+        for part in self.engine._engine.model_parts:
+            part.train()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.engine.optimizer_zero_grad()
+        super().__exit__(exc_type, exc_value, traceback)  # offload model (+ optimizer) to CPU (if enabled)
