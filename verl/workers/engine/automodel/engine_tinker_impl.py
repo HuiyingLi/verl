@@ -15,8 +15,9 @@
 
 Standalone ``BaseEngine`` implementation (does not depend on the legacy
 automodel engine). It builds the model with the current Automodel API
-(``build_model`` + ``create_distributed_setup_from_config``) and delegates the
-training step to ``nemo_automodel.components.training.engine.Engine`` via its ``PackedBatch``
+(``NeMoAutoModelForCausalLM.from_pretrained`` +
+``create_distributed_setup_from_config``) and delegates the training step to
+``nemo_automodel.components.training.engine.Engine`` via its ``PackedBatch``
 pass-through door: the Engine owns the microbatch lifecycle, forward, per-datum
 logprob extraction, gradient clipping and the optimizer step. verl keeps its
 data layout (THD remove-padding) and its loss functions; a thin bridge maps the
@@ -65,6 +66,7 @@ class AutomodelEngine(BaseEngine):
             cp_size=ec.cp_size,
             ep_size=ec.ep_size,
             dp_replicate_size=ec.dp_replicate_size,
+            activation_checkpointing=ec.activation_checkpointing,
             world_size=self.world_size,
         )
         self.device_mesh = self._dist_setup.mesh_context.device_mesh
@@ -80,36 +82,96 @@ class AutomodelEngine(BaseEngine):
 
     # ── construction: current Automodel build + tinker Engine ────────────────
 
-    def initialize(self):
-        from nemo_automodel.components.config.loader import ConfigNode
-        from nemo_automodel.recipes.llm.train_ft import build_model
+    def _build_module(self):
+        from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM
+        from nemo_automodel.components.training.rng import ScopedRNG
+        from verl.utils.torch_dtypes import PrecisionType
 
         ec = self.engine_config
-        dist_setup = self._dist_setup
+        backend = dict(ec.backend_config or {})
+        # Disable fused TE RoPE: the fused kernel indexes rotary angles by
+        # physical sequence position and assumes contiguous [0, seq_len)
+        # positions, so it does NOT honor the per-sequence position_id resets
+        # of a THD-packed batch. With packed GRPO micro-batches that silently
+        # corrupts RoPE for every non-first sequence in a pack (logprobs drift
+        # vs the vLLM rollout, breaking the importance ratio). The non-fused
+        # path gathers cos/sin by position_id value and is packing-correct.
+        backend["rope_fusion"] = False
 
-        model_cfg = ConfigNode(
-            {
-                "_target_": "nemo_automodel._transformers.auto_model.NeMoAutoModelForCausalLM.from_pretrained",
-                "pretrained_model_name_or_path": self.model_config.path,
-                "trust_remote_code": getattr(self.model_config, "trust_remote_code", False),
-                "attn_implementation": ec.attn_implementation,
-                # Disable fused TE RoPE: the fused kernel indexes rotary angles by
-                # physical sequence position and assumes contiguous [0, seq_len)
-                # positions, so it does NOT honor the per-sequence position_id resets
-                # of a THD-packed batch. With packed GRPO micro-batches that silently
-                # corrupts RoPE for every non-first sequence in a pack (logprobs drift
-                # vs the vLLM rollout, breaking the importance ratio). The non-fused
-                # path gathers cos/sin by position_id value and is packing-correct.
-                "backend": {"rope_fusion": False},
-            }
+        with ScopedRNG(seed=ec.seed, ranked=True):
+            return NeMoAutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=self.model_config.path,
+                trust_remote_code=getattr(self.model_config, "trust_remote_code", False),
+                attn_implementation=ec.attn_implementation,
+                torch_dtype=PrecisionType.to_dtype(ec.model_dtype),
+                distributed_setup=self._dist_setup,
+                backend=backend,
+            )
+
+    def _build_optimizers(self):
+        import inspect
+
+        from nemo_automodel.components.optim import build_optimizer_config
+
+        cfg = self.optimizer_config
+        overrides = dict(cfg.override_optimizer_config or {})
+        target = cfg.optimizer
+        optimizer_impl = getattr(cfg, "optimizer_impl", None)
+        if optimizer_impl and "." not in target and target != target.lower():
+            target = f"{optimizer_impl}.{target}"
+        opt_cfg = build_optimizer_config(target, overrides)
+        non_optimizer_fields = {
+            "optimizer",
+            "optimizer_impl",
+            "override_optimizer_config",
+            "lr_warmup_steps_ratio",
+            "total_training_steps",
+            "lr_warmup_steps",
+            "clip_grad",
+            "grad_clip",
+            "init_lr_ratio",
+            "min_lr_ratio",
+            "lr_scheduler_type",
+            "wd_incr_style",
+            "num_cycles",
+            "zero_indexed_step",
+        }
+        cfg_dict = cfg.to_dict() if hasattr(cfg, "to_dict") else vars(cfg)
+        factory = getattr(opt_cfg, "factory", None)
+        factory_params = {}
+        factory_accepts_kwargs = False
+        if callable(factory):
+            try:
+                signature = inspect.signature(factory)
+                factory_params = signature.parameters
+                factory_accepts_kwargs = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in factory_params.values()
+                )
+            except (TypeError, ValueError):
+                pass
+        for key, value in cfg_dict.items():
+            if key in non_optimizer_fields or key in overrides or value is None:
+                continue
+            value = tuple(value) if key == "betas" else value
+            if hasattr(opt_cfg, key):
+                setattr(opt_cfg, key, value)
+            elif hasattr(opt_cfg, "kwargs") and (key in factory_params or factory_accepts_kwargs):
+                opt_cfg.kwargs.setdefault(key, value)
+        return opt_cfg.build(self.module, device_mesh=self.device_mesh, is_peft=False)
+
+    def initialize(self):
+        ec = self.engine_config
+        self.module = self._build_module()
+
+        optimizers = [] if ec.forward_only else self._build_optimizers()
+
+        engine_cfg = Engine.Config(max_grad_norm=self.optimizer_config.clip_grad)
+        self._engine = Engine(
+            config=engine_cfg,
+            model_parts=[self.module],
+            optimizers=optimizers,
+            distributed_setup=self._dist_setup,
         )
-        self.module = build_model(model_cfg, None, seed=ec.seed, distributed_setup=dist_setup)
-
-        optimizers = []
-        if not ec.forward_only:
-            optimizers = [torch.optim.AdamW(self.module.parameters(), lr=self.optimizer_config.lr)]
-
-        self._engine = Engine(model_parts=[self.module], optimizers=optimizers, distributed_setup=dist_setup)
 
     # ── data: verl THD micro-batch -> Engine PackedBatch ─────────────────────
 

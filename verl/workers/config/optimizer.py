@@ -175,12 +175,14 @@ class TorchtitanOptimizerConfig(OptimizerConfig):
 class AutomodelOptimizerConfig(OptimizerConfig):
     """Automodel optimizer configuration extending base OptimizerConfig.
 
-    Uses the same optimizer building mechanism as FSDP (dynamic import from optimizer_impl).
+    Uses Automodel's optimizer target resolution.
     LR scheduling is handled by Automodel's OptimizerParamScheduler.
 
     Args:
-        optimizer (str): Optimizer class name (e.g., "AdamW").
-        optimizer_impl (str): Module path to import optimizer from (e.g., "torch.optim").
+        optimizer (str): Automodel optimizer target. This may be an Automodel registry
+            name (e.g., "adamw", "fused_adam") or a dotted import path.
+        optimizer_impl (Optional[str]): Deprecated compatibility field for existing
+            configs that split module path and class name.
         lr (float): Learning rate (maps to max_lr in OptimizerParamScheduler).
         init_lr_ratio (Optional[float]): Initial LR ratio for warmup start (init_lr = lr * init_lr_ratio).
         min_lr_ratio (Optional[float]): Minimum LR ratio after decay (min_lr = lr * min_lr_ratio).
@@ -193,8 +195,8 @@ class AutomodelOptimizerConfig(OptimizerConfig):
     _mutable_fields = OptimizerConfig._mutable_fields.copy()
     _mutable_fields.add("lr_scheduler_type")
 
-    optimizer: str = "AdamW"
-    optimizer_impl: str = "torch.optim"
+    optimizer: str = "adamw"
+    optimizer_impl: Optional[str] = None
     init_lr_ratio: Optional[float] = 0.1
     min_lr_ratio: Optional[float] = 0.01
     lr_scheduler_type: str = "cosine"

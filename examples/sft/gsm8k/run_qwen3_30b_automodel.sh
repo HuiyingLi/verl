@@ -48,8 +48,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     engine.attn_implementation=te \
     engine.use_torch_compile=False \
     optim=automodel \
-    optim.optimizer=FusedAdam \
-    optim.optimizer_impl=transformer_engine.pytorch.optimizers.fused_adam \
+    optim.optimizer=transformer_engine.pytorch.optimizers.fused_adam.FusedAdam \
     optim.lr=1e-5 \
     optim.lr_warmup_steps_ratio=0.1 \
     optim.weight_decay=0 \
@@ -58,10 +57,10 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     optim.init_lr_ratio=0.1 \
     optim.min_lr_ratio=0.01 \
     optim.lr_scheduler_type=cosine \
-    optim.master_weights=true \
-    optim.store_param_remainders=true \
-    optim.exp_avg_dtype=bf16 \
-    optim.exp_avg_sq_dtype=bf16 \
+    optim.override_optimizer_config.master_weights=true \
+    optim.override_optimizer_config.store_param_remainders=true \
+    optim.override_optimizer_config.exp_avg_dtype=bf16 \
+    optim.override_optimizer_config.exp_avg_sq_dtype=bf16 \
     trainer.default_local_dir=$save_path \
     trainer.project_name=hellaswag-sft \
     trainer.experiment_name=hellaswag-sft-qwen3-30b-automodel \
