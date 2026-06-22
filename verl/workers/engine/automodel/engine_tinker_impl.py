@@ -150,12 +150,10 @@ class AutomodelEngine(BaseEngine):
         from nemo_automodel.components.optim import build_optimizer_config
 
         cfg = self.optimizer_config
-        overrides = dict(cfg.override_optimizer_config or {})
         target = cfg.optimizer
         optimizer_impl = getattr(cfg, "optimizer_impl", None)
         if optimizer_impl and "." not in target and target != target.lower():
             target = f"{optimizer_impl}.{target}"
-        opt_cfg = build_optimizer_config(target, overrides)
 
         optimizer_kwargs = {
             "lr": cfg.lr,
@@ -173,14 +171,9 @@ class AutomodelEngine(BaseEngine):
             value = getattr(cfg, key, None)
             if value:
                 optimizer_kwargs[key] = value
+        optimizer_kwargs.update(cfg.optimizer_kwargs or {})
 
-        for key, value in optimizer_kwargs.items():
-            if key in overrides:
-                continue
-            if hasattr(opt_cfg, key):
-                setattr(opt_cfg, key, value)
-            elif hasattr(opt_cfg, "kwargs"):
-                opt_cfg.kwargs.setdefault(key, value)
+        opt_cfg = build_optimizer_config(target, optimizer_kwargs)
         return opt_cfg.build(self.module, device_mesh=self.device_mesh, is_peft=False)
 
     def _build_lr_schedulers(self, optimizers):

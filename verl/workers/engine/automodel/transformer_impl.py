@@ -179,8 +179,8 @@ class AutomodelEngine(BaseEngine):
             if val is not None:
                 opt_dict[attr] = _short_to_torch.get(val, val)
 
-        if config.override_optimizer_config:
-            opt_dict.update(config.override_optimizer_config)
+        if config.optimizer_kwargs:
+            opt_dict.update(config.optimizer_kwargs)
 
         cfg_opt = ConfigNode(opt_dict)
         optimizers = automodel_build_optimizer(module, cfg_opt, self.distributed_config, self.device_mesh)

@@ -57,10 +57,10 @@ torchrun --standalone --nnodes=1 --nproc_per_node=$nproc_per_node \
     optim.init_lr_ratio=0.1 \
     optim.min_lr_ratio=0.01 \
     optim.lr_scheduler_type=cosine \
-    optim.override_optimizer_config.master_weights=true \
-    optim.override_optimizer_config.store_param_remainders=true \
-    optim.override_optimizer_config.exp_avg_dtype=bf16 \
-    optim.override_optimizer_config.exp_avg_sq_dtype=bf16 \
+    optim.master_weights=true \
+    optim.store_param_remainders=true \
+    optim.exp_avg_dtype=bf16 \
+    optim.exp_avg_sq_dtype=bf16 \
     trainer.default_local_dir=$save_path \
     trainer.project_name=hellaswag-sft \
     trainer.experiment_name=hellaswag-sft-qwen3-30b-automodel \

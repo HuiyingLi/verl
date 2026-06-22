@@ -53,4 +53,4 @@ exp_avg_sq_dtype: null    # "fp32", "bf16"
 master_weight_dtype: null # "fp32", "bf16"
 
 # Additional optimizer kwargs (passed directly to constructor)
-override_optimizer_config: {}
+optimizer_kwargs: {}

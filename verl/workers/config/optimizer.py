@@ -190,6 +190,7 @@ class AutomodelOptimizerConfig(OptimizerConfig):
         wd_incr_style (str): Weight decay increment style: "constant", "linear", or "cosine".
         num_cycles (float): Kept for backward compatibility (unused by Automodel scheduler).
         zero_indexed_step (bool): Kept for backward compatibility (unused by Automodel scheduler).
+        optimizer_kwargs (Optional[dict]): Additional kwargs passed directly to the Automodel optimizer config.
     """
 
     _mutable_fields = OptimizerConfig._mutable_fields.copy()
@@ -210,7 +211,7 @@ class AutomodelOptimizerConfig(OptimizerConfig):
     exp_avg_dtype: Optional[str] = None  # "fp32", "bf16", "fp16", or "torch.float32" etc.
     exp_avg_sq_dtype: Optional[str] = None  # "fp32", "bf16", "fp16", or "torch.float32" etc.
     master_weight_dtype: Optional[str] = None  # "fp32", "bf16", "fp16", or "torch.float32" etc.
-    override_optimizer_config: Optional[dict] = None
+    optimizer_kwargs: Optional[dict] = None
 
     def __post_init__(self):
         assert self.lr_scheduler_type in ["constant", "cosine", "linear", "inverse-square-root"]
