@@ -161,16 +161,6 @@ class AutomodelEngine(BaseEngine):
             "eps": cfg.eps,
             "betas": tuple(cfg.betas),
         }
-        for key in (
-            "master_weights",
-            "store_param_remainders",
-            "exp_avg_dtype",
-            "exp_avg_sq_dtype",
-            "master_weight_dtype",
-        ):
-            value = getattr(cfg, key, None)
-            if value:
-                optimizer_kwargs[key] = value
         optimizer_kwargs.update(cfg.optimizer_kwargs or {})
 
         opt_cfg = build_optimizer_config(target, optimizer_kwargs)
