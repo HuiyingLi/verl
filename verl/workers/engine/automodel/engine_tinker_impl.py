@@ -25,7 +25,6 @@ Engine's per-datum ``ModelOutput`` back to verl's flat ``model_output["log_probs
 """
 
 import torch
-
 from nemo_automodel.components.datasets.datum import PackedBatch
 from nemo_automodel.components.training.engine import Engine
 
@@ -46,18 +45,12 @@ class AutomodelEngine(BaseEngine):
         self.optimizer_config = optimizer_config
         self.checkpoint_config = checkpoint_config
         self.mode = None
-        self.rank = torch.distributed.get_rank()
-        self.world_size = torch.distributed.get_world_size()
-        self._param_offload = engine_config.param_offload
-        self._optim_offload = engine_config.optimizer_offload
         self._engine = None
         # Build the distributed setup eagerly: the worker queries dp rank/size in
         # its __init__ (before init_model), so the mesh must exist now.
         self._build_distributed()
 
     def _build_distributed(self):
-        from torch.distributed.fsdp import MixedPrecisionPolicy
-
         from nemo_automodel.components.distributed.config import (
             DDPConfig,
             DistributedSetup,
@@ -66,6 +59,8 @@ class AutomodelEngine(BaseEngine):
             MoEParallelizerConfig,
         )
         from nemo_automodel.components.distributed.mesh import ParallelismSizes
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+
         from verl.utils.torch_dtypes import PrecisionType
 
         ec = self.engine_config
@@ -99,34 +94,35 @@ class AutomodelEngine(BaseEngine):
 
         moe_parallel_config = None
         if ec.ep_size > 1:
-            moe_kwargs = dict(ec.moe_config or {})
-            if hasattr(strategy, "mp_policy"):
-                moe_kwargs.setdefault("mp_policy", strategy.mp_policy)
-            moe_parallel_config = MoEParallelizerConfig(**moe_kwargs)
+            moe_parallel_config = MoEParallelizerConfig(
+                **({"mp_policy": strategy.mp_policy} if hasattr(strategy, "mp_policy") else {}),
+                **(ec.moe_config or {}),
+            )
 
         self._dist_setup = DistributedSetup.build(
             strategy=strategy,
             parallelism_sizes=parallelism_sizes,
             moe_parallel_config=moe_parallel_config,
             activation_checkpointing=ec.activation_checkpointing,
-            world_size=self.world_size,
+            world_size=torch.distributed.get_world_size(),
         )
         self.device_mesh = self._dist_setup.mesh_context.device_mesh
         self.moe_mesh = self._dist_setup.mesh_context.moe_mesh
 
     @property
     def is_param_offload_enabled(self) -> bool:
-        return self._param_offload
+        return self.engine_config.param_offload
 
     @property
     def is_optimizer_offload_enabled(self) -> bool:
-        return self._optim_offload
+        return self.engine_config.optimizer_offload
 
     # ── construction: current Automodel build + tinker Engine ────────────────
 
     def _build_module(self):
         from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM
         from nemo_automodel.components.training.rng import ScopedRNG
+
         from verl.utils.torch_dtypes import PrecisionType
 
         ec = self.engine_config
@@ -151,8 +147,6 @@ class AutomodelEngine(BaseEngine):
             )
 
     def _build_optimizers(self):
-        import inspect
-
         from nemo_automodel.components.optim import build_optimizer_config
 
         cfg = self.optimizer_config
@@ -162,49 +156,35 @@ class AutomodelEngine(BaseEngine):
         if optimizer_impl and "." not in target and target != target.lower():
             target = f"{optimizer_impl}.{target}"
         opt_cfg = build_optimizer_config(target, overrides)
-        non_optimizer_fields = {
-            "optimizer",
-            "optimizer_impl",
-            "override_optimizer_config",
-            "lr_warmup_steps_ratio",
-            "total_training_steps",
-            "lr_warmup_steps",
-            "clip_grad",
-            "grad_clip",
-            "init_lr_ratio",
-            "min_lr_ratio",
-            "lr_scheduler_type",
-            "wd_incr_style",
-            "num_cycles",
-            "zero_indexed_step",
+
+        optimizer_kwargs = {
+            "lr": cfg.lr,
+            "weight_decay": cfg.weight_decay,
+            "eps": cfg.eps,
+            "betas": tuple(cfg.betas),
         }
-        cfg_dict = cfg.to_dict() if hasattr(cfg, "to_dict") else vars(cfg)
-        factory = getattr(opt_cfg, "factory", None)
-        factory_params = {}
-        factory_accepts_kwargs = False
-        if callable(factory):
-            try:
-                signature = inspect.signature(factory)
-                factory_params = signature.parameters
-                factory_accepts_kwargs = any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD for p in factory_params.values()
-                )
-            except (TypeError, ValueError):
-                pass
-        for key, value in cfg_dict.items():
-            if key in non_optimizer_fields or key in overrides or value is None:
+        for key in (
+            "master_weights",
+            "store_param_remainders",
+            "exp_avg_dtype",
+            "exp_avg_sq_dtype",
+            "master_weight_dtype",
+        ):
+            value = getattr(cfg, key, None)
+            if value:
+                optimizer_kwargs[key] = value
+
+        for key, value in optimizer_kwargs.items():
+            if key in overrides:
                 continue
-            value = tuple(value) if key == "betas" else value
             if hasattr(opt_cfg, key):
                 setattr(opt_cfg, key, value)
-            elif hasattr(opt_cfg, "kwargs") and (key in factory_params or factory_accepts_kwargs):
+            elif hasattr(opt_cfg, "kwargs"):
                 opt_cfg.kwargs.setdefault(key, value)
         return opt_cfg.build(self.module, device_mesh=self.device_mesh, is_peft=False)
 
     def _build_lr_schedulers(self, optimizers):
-        from types import SimpleNamespace
-
-        from nemo_automodel.components.optim import LRSchedulerConfig
+        from nemo_automodel.components.optim import OptimizerParamScheduler
 
         cfg = self.optimizer_config
         total_steps = cfg.total_training_steps
@@ -217,7 +197,7 @@ class AutomodelEngine(BaseEngine):
 
         init_lr_ratio = cfg.init_lr_ratio if cfg.init_lr_ratio is not None else 0.1
         min_lr_ratio = cfg.min_lr_ratio if cfg.min_lr_ratio is not None else 0.01
-        scheduler_config = LRSchedulerConfig(
+        scheduler_kwargs = dict(
             lr_warmup_steps=num_warmup_steps,
             lr_decay_steps=total_steps,
             lr_decay_style=cfg.lr_scheduler_type,
@@ -229,8 +209,7 @@ class AutomodelEngine(BaseEngine):
             wd_incr_steps=total_steps,
             wd_incr_style=getattr(cfg, "wd_incr_style", "constant"),
         )
-        step_schedule = SimpleNamespace(epoch_len=None, max_steps=total_steps, num_epochs=1)
-        return scheduler_config.build(optimizers, step_schedule)
+        return [OptimizerParamScheduler(optimizer=optimizer, **scheduler_kwargs) for optimizer in optimizers]
 
     def initialize(self):
         ec = self.engine_config
@@ -323,30 +302,25 @@ class AutomodelEngine(BaseEngine):
     def lr_scheduler_step(self):
         return self._engine.lr_scheduler_step()
 
-    def _dp_group(self):
+    def _dp_mesh(self):
         if not self.device_mesh:
             return None
         from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
 
         name = "dp_cp" if self.device_mesh["cp"].size() > 1 else "dp"
-        return get_flat_mesh(self.device_mesh, name).get_group()
+        return get_flat_mesh(self.device_mesh, name)
 
     def get_data_parallel_rank(self):
-        if not self.device_mesh:
-            return torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-
-        name = "dp_cp" if self.device_mesh["cp"].size() > 1 else "dp"
-        return get_flat_mesh(self.device_mesh, name).get_local_rank()
+        mesh = self._dp_mesh()
+        return mesh.get_local_rank() if mesh is not None else torch.distributed.get_rank()
 
     def get_data_parallel_size(self):
-        group = self._dp_group()
-        if group is None:
-            return torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        return group.size()
+        group = self.get_data_parallel_group()
+        return group.size() if group is not None else torch.distributed.get_world_size()
 
     def get_data_parallel_group(self):
-        return self._dp_group()
+        mesh = self._dp_mesh()
+        return mesh.get_group() if mesh is not None else None
 
     def is_mp_src_rank_with_outputs(self):
         return True  # non-PP: every rank carries outputs
@@ -387,47 +361,23 @@ class AutomodelEngine(BaseEngine):
         return self._engine.disable_adapter()
 
     def train_mode(self, **kwargs):
-        return EngineTrainModeCtx(self, **kwargs)
+        return EngineModeCtx(self, training=True, **kwargs)
 
     def eval_mode(self, **kwargs):
-        return EngineEvalModeCtx(self, **kwargs)
+        return EngineModeCtx(self, training=False, **kwargs)
 
 
-class EngineEvalModeCtx(BaseEngineCtx):
-    """Eval context. ``BaseEngineCtx`` drives parameter onload (enter) / offload
-    (exit) — gated by ``is_param_offload_enabled`` and ``disable_auto_offload``,
-    so it is a no-op when offload is disabled (params stay resident). We add the
-    per-part ``eval()`` switch. Mirrors fsdp/megatron/torchtitan/veomni, which all
-    subclass ``BaseEngineCtx`` and only add the train/eval toggle.
-    """
-
-    def __init__(self, engine: AutomodelEngine, **kwargs):
-        super().__init__(engine=engine, mode="eval", **kwargs)
+class EngineModeCtx(BaseEngineCtx):
+    def __init__(self, engine: AutomodelEngine, training: bool, **kwargs):
+        self.training = training
+        super().__init__(engine=engine, mode="train" if training else "eval", **kwargs)
 
     def __enter__(self):
-        super().__enter__()  # onload (if param_offload) + set engine.mode
+        super().__enter__()
         for part in self.engine._engine.model_parts:
-            part.eval()
+            part.train(self.training)
 
     def __exit__(self, exc_type, exc_value, traceback):
-        super().__exit__(exc_type, exc_value, traceback)  # offload model to CPU (if param_offload)
-
-
-class EngineTrainModeCtx(BaseEngineCtx):
-    """Train context. ``BaseEngineCtx`` onloads model (+optimizer/grad) on enter
-    and offloads on exit, gated by ``is_param_offload_enabled`` /
-    ``is_optimizer_offload_enabled``. We add the per-part ``train()`` switch and
-    zero grads before offload (so no grad tensors are stranded on either device).
-    """
-
-    def __init__(self, engine: AutomodelEngine, **kwargs):
-        super().__init__(engine=engine, mode="train", **kwargs)
-
-    def __enter__(self):
-        super().__enter__()  # onload model (+ optimizer/grad if their offload is enabled) + set mode
-        for part in self.engine._engine.model_parts:
-            part.train()
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.engine.optimizer_zero_grad()
-        super().__exit__(exc_type, exc_value, traceback)  # offload model (+ optimizer) to CPU (if enabled)
+        if self.training:
+            self.engine.optimizer_zero_grad()
+        return super().__exit__(exc_type, exc_value, traceback)
