@@ -16,7 +16,7 @@
 Standalone ``BaseEngine`` implementation (does not depend on the legacy
 automodel engine). It builds the model with the current Automodel API
 (``NeMoAutoModelForCausalLM.from_pretrained`` +
-``create_distributed_setup_from_config``) and delegates the training step to
+``DistributedSetup.build``) and delegates the training step to
 ``nemo_automodel.components.training.engine.Engine`` via its ``PackedBatch``
 pass-through door: the Engine owns the microbatch lifecycle, forward, per-datum
 logprob extraction, gradient clipping and the optimizer step. verl keeps its
@@ -56,16 +56,58 @@ class AutomodelEngine(BaseEngine):
         self._build_distributed()
 
     def _build_distributed(self):
-        from nemo_automodel.recipes._dist_utils import create_distributed_setup_from_config
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+
+        from nemo_automodel.components.distributed.config import (
+            DDPConfig,
+            DistributedSetup,
+            FSDP2Config,
+            MegatronFSDPConfig,
+            MoEParallelizerConfig,
+        )
+        from nemo_automodel.components.distributed.mesh import ParallelismSizes
+        from verl.utils.torch_dtypes import PrecisionType
 
         ec = self.engine_config
-        self._dist_setup = create_distributed_setup_from_config(
-            strategy=ec.distributed_strategy,
+        parallelism_sizes = ParallelismSizes(
             tp_size=ec.tp_size,
             pp_size=ec.pp_size,
             cp_size=ec.cp_size,
             ep_size=ec.ep_size,
             dp_replicate_size=ec.dp_replicate_size,
+        )
+
+        if ec.distributed_strategy == "fsdp2":
+            mp_policy = MixedPrecisionPolicy(
+                param_dtype=PrecisionType.to_dtype(ec.mp_param_dtype),
+                reduce_dtype=PrecisionType.to_dtype(ec.mp_reduce_dtype),
+                output_dtype=PrecisionType.to_dtype(ec.mp_output_dtype),
+                cast_forward_inputs=True,
+            )
+            strategy = FSDP2Config(
+                sequence_parallel=ec.sequence_parallel,
+                mp_policy=mp_policy,
+                activation_checkpointing=ec.activation_checkpointing,
+                defer_fsdp_grad_sync=ec.defer_fsdp_grad_sync,
+            )
+        elif ec.distributed_strategy == "ddp":
+            strategy = DDPConfig(activation_checkpointing=ec.activation_checkpointing)
+        elif ec.distributed_strategy == "megatron_fsdp":
+            strategy = MegatronFSDPConfig(activation_checkpointing=ec.activation_checkpointing)
+        else:
+            raise ValueError(f"Unsupported distributed_strategy: {ec.distributed_strategy}")
+
+        moe_parallel_config = None
+        if ec.ep_size > 1:
+            moe_kwargs = dict(ec.moe_config or {})
+            if hasattr(strategy, "mp_policy"):
+                moe_kwargs.setdefault("mp_policy", strategy.mp_policy)
+            moe_parallel_config = MoEParallelizerConfig(**moe_kwargs)
+
+        self._dist_setup = DistributedSetup.build(
+            strategy=strategy,
+            parallelism_sizes=parallelism_sizes,
+            moe_parallel_config=moe_parallel_config,
             activation_checkpointing=ec.activation_checkpointing,
             world_size=self.world_size,
         )
@@ -159,17 +201,50 @@ class AutomodelEngine(BaseEngine):
                 opt_cfg.kwargs.setdefault(key, value)
         return opt_cfg.build(self.module, device_mesh=self.device_mesh, is_peft=False)
 
+    def _build_lr_schedulers(self, optimizers):
+        from types import SimpleNamespace
+
+        from nemo_automodel.components.optim import LRSchedulerConfig
+
+        cfg = self.optimizer_config
+        total_steps = cfg.total_training_steps
+        if total_steps <= 0:
+            raise ValueError("optim.total_training_steps must be set before building the Automodel LR scheduler.")
+
+        num_warmup_steps = cfg.lr_warmup_steps
+        if num_warmup_steps is None or num_warmup_steps <= 0:
+            num_warmup_steps = int(cfg.lr_warmup_steps_ratio * total_steps)
+
+        init_lr_ratio = cfg.init_lr_ratio if cfg.init_lr_ratio is not None else 0.1
+        min_lr_ratio = cfg.min_lr_ratio if cfg.min_lr_ratio is not None else 0.01
+        scheduler_config = LRSchedulerConfig(
+            lr_warmup_steps=num_warmup_steps,
+            lr_decay_steps=total_steps,
+            lr_decay_style=cfg.lr_scheduler_type,
+            init_lr=cfg.lr * init_lr_ratio,
+            max_lr=cfg.lr,
+            min_lr=cfg.lr * min_lr_ratio,
+            start_wd=cfg.weight_decay,
+            end_wd=cfg.weight_decay,
+            wd_incr_steps=total_steps,
+            wd_incr_style=getattr(cfg, "wd_incr_style", "constant"),
+        )
+        step_schedule = SimpleNamespace(epoch_len=None, max_steps=total_steps, num_epochs=1)
+        return scheduler_config.build(optimizers, step_schedule)
+
     def initialize(self):
         ec = self.engine_config
         self.module = self._build_module()
 
         optimizers = [] if ec.forward_only else self._build_optimizers()
+        lr_schedulers = [] if ec.forward_only else self._build_lr_schedulers(optimizers)
 
         engine_cfg = Engine.Config(max_grad_norm=self.optimizer_config.clip_grad)
         self._engine = Engine(
             config=engine_cfg,
             model_parts=[self.module],
             optimizers=optimizers,
+            lr_schedulers=lr_schedulers,
             distributed_setup=self._dist_setup,
         )
 
