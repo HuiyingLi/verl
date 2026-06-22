@@ -168,19 +168,8 @@ class AutomodelEngine(BaseEngine):
             "betas": list(config.betas),
         }
 
-        if config.master_weights:
-            opt_dict["master_weights"] = config.master_weights
-        if config.store_param_remainders:
-            opt_dict["store_param_remainders"] = config.store_param_remainders
-
-        _short_to_torch = {"bf16": "torch.bfloat16", "fp32": "torch.float32", "fp16": "torch.float16"}
-        for attr in ("exp_avg_dtype", "exp_avg_sq_dtype", "master_weight_dtype"):
-            val = getattr(config, attr, None)
-            if val is not None:
-                opt_dict[attr] = _short_to_torch.get(val, val)
-
-        if config.override_optimizer_config:
-            opt_dict.update(config.override_optimizer_config)
+        if config.optimizer_kwargs:
+            opt_dict.update(config.optimizer_kwargs)
 
         cfg_opt = ConfigNode(opt_dict)
         optimizers = automodel_build_optimizer(module, cfg_opt, self.distributed_config, self.device_mesh)

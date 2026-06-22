@@ -1,0 +1,13 @@
+# automodel ref config (nemo_automodel tinker Engine), inheriting from ref.yaml
+defaults:
+  - ../optim@optim: automodel
+  - ../engine@automodel: automodel
+  - ref
+  - _self_
+
+_target_: verl.workers.config.AutomodelActorConfig
+
+strategy: automodel
+
+automodel:
+  forward_only: True

@@ -175,12 +175,14 @@ class TorchtitanOptimizerConfig(OptimizerConfig):
 class AutomodelOptimizerConfig(OptimizerConfig):
     """Automodel optimizer configuration extending base OptimizerConfig.
 
-    Uses the same optimizer building mechanism as FSDP (dynamic import from optimizer_impl).
+    Uses Automodel's optimizer target resolution.
     LR scheduling is handled by Automodel's OptimizerParamScheduler.
 
     Args:
-        optimizer (str): Optimizer class name (e.g., "AdamW").
-        optimizer_impl (str): Module path to import optimizer from (e.g., "torch.optim").
+        optimizer (str): Automodel optimizer target. This may be an Automodel registry
+            name (e.g., "adamw", "fused_adam") or a dotted import path.
+        optimizer_impl (Optional[str]): Deprecated compatibility field for existing
+            configs that split module path and class name.
         lr (float): Learning rate (maps to max_lr in OptimizerParamScheduler).
         init_lr_ratio (Optional[float]): Initial LR ratio for warmup start (init_lr = lr * init_lr_ratio).
         min_lr_ratio (Optional[float]): Minimum LR ratio after decay (min_lr = lr * min_lr_ratio).
@@ -188,27 +190,22 @@ class AutomodelOptimizerConfig(OptimizerConfig):
         wd_incr_style (str): Weight decay increment style: "constant", "linear", or "cosine".
         num_cycles (float): Kept for backward compatibility (unused by Automodel scheduler).
         zero_indexed_step (bool): Kept for backward compatibility (unused by Automodel scheduler).
+        optimizer_kwargs (Optional[dict]): Additional kwargs passed directly to the Automodel optimizer config.
     """
 
     _mutable_fields = OptimizerConfig._mutable_fields.copy()
     _mutable_fields.add("lr_scheduler_type")
 
-    optimizer: str = "AdamW"
-    optimizer_impl: str = "torch.optim"
+    optimizer: str = "adamw"
+    optimizer_impl: Optional[str] = None
     init_lr_ratio: Optional[float] = 0.1
     min_lr_ratio: Optional[float] = 0.01
     lr_scheduler_type: str = "cosine"
     wd_incr_style: str = "constant"
     num_cycles: float = 0.5
     zero_indexed_step: bool = True
-    # Common optimizer kwargs
     eps: float = 1e-8
-    master_weights: bool = False
-    store_param_remainders: bool = False
-    exp_avg_dtype: Optional[str] = None  # "fp32", "bf16", "fp16", or "torch.float32" etc.
-    exp_avg_sq_dtype: Optional[str] = None  # "fp32", "bf16", "fp16", or "torch.float32" etc.
-    master_weight_dtype: Optional[str] = None  # "fp32", "bf16", "fp16", or "torch.float32" etc.
-    override_optimizer_config: Optional[dict] = None
+    optimizer_kwargs: Optional[dict] = None
 
     def __post_init__(self):
         assert self.lr_scheduler_type in ["constant", "cosine", "linear", "inverse-square-root"]
