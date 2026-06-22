@@ -56,7 +56,6 @@ class AutomodelEngine(BaseEngine):
             DistributedSetup,
             FSDP2Config,
             MegatronFSDPConfig,
-            MoEParallelizerConfig,
         )
         from nemo_automodel.components.distributed.mesh import ParallelismSizes
         from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -92,19 +91,11 @@ class AutomodelEngine(BaseEngine):
         else:
             raise ValueError(f"Unsupported distributed_strategy: {ec.distributed_strategy}")
 
-        moe_parallel_config = None
-        if ec.ep_size > 1:
-            moe_parallel_config = MoEParallelizerConfig(
-                **({"mp_policy": strategy.mp_policy} if hasattr(strategy, "mp_policy") else {}),
-                **(ec.moe_config or {}),
-            )
-
         self._dist_setup = DistributedSetup.build(
             strategy=strategy,
             parallelism_sizes=parallelism_sizes,
-            moe_parallel_config=moe_parallel_config,
+            moe_parallel_config=(dict(ec.moe_config) if ec.moe_config else None) if ec.ep_size > 1 else None,
             activation_checkpointing=ec.activation_checkpointing,
-            world_size=torch.distributed.get_world_size(),
         )
         self.device_mesh = self._dist_setup.mesh_context.device_mesh
         self.moe_mesh = self._dist_setup.mesh_context.moe_mesh
@@ -180,19 +171,27 @@ class AutomodelEngine(BaseEngine):
 
         init_lr_ratio = cfg.init_lr_ratio if cfg.init_lr_ratio is not None else 0.1
         min_lr_ratio = cfg.min_lr_ratio if cfg.min_lr_ratio is not None else 0.01
-        scheduler_kwargs = dict(
-            lr_warmup_steps=num_warmup_steps,
-            lr_decay_steps=total_steps,
-            lr_decay_style=cfg.lr_scheduler_type,
-            init_lr=cfg.lr * init_lr_ratio,
-            max_lr=cfg.lr,
-            min_lr=cfg.lr * min_lr_ratio,
-            start_wd=cfg.weight_decay,
-            end_wd=cfg.weight_decay,
-            wd_incr_steps=total_steps,
-            wd_incr_style=getattr(cfg, "wd_incr_style", "constant"),
-        )
-        return [OptimizerParamScheduler(optimizer=optimizer, **scheduler_kwargs) for optimizer in optimizers]
+        lr_schedulers = []
+        for optimizer in optimizers:
+            param_group = optimizer.param_groups[0]
+            lr = param_group["lr"]
+            weight_decay = param_group.get("weight_decay", 0.0)
+            lr_schedulers.append(
+                OptimizerParamScheduler(
+                    optimizer=optimizer,
+                    lr_warmup_steps=num_warmup_steps,
+                    lr_decay_steps=total_steps,
+                    lr_decay_style=cfg.lr_scheduler_type,
+                    init_lr=lr * init_lr_ratio,
+                    max_lr=lr,
+                    min_lr=lr * min_lr_ratio,
+                    start_wd=weight_decay,
+                    end_wd=weight_decay,
+                    wd_incr_steps=total_steps,
+                    wd_incr_style=getattr(cfg, "wd_incr_style", "constant"),
+                )
+            )
+        return lr_schedulers
 
     def initialize(self):
         ec = self.engine_config
