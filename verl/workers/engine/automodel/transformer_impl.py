@@ -17,14 +17,13 @@
 import gc
 import logging
 import os
+from contextlib import nullcontext
 from typing import Any, Callable, Optional
 
 import torch
 import torch.distributed
 from huggingface_hub.constants import HF_HUB_CACHE
 from nemo_automodel import (
-    Datum,
-    LossInputLayout,
     NeMoAutoModelForCausalLM,
     NeMoAutoModelForImageTextToText,
 )
@@ -38,9 +37,9 @@ from nemo_automodel.components.distributed import (
 )
 from nemo_automodel.components.distributed.megatron_fsdp import maybe_shard_optimizer
 from nemo_automodel.components.distributed.mesh_utils import get_flat_mesh
-from nemo_automodel.components.loss import vocab_parallel_entropy, vocab_parallel_log_probs
+from nemo_automodel.components.loss import token_entropy, token_log_probs
 from nemo_automodel.components.optim import OptimizerParamScheduler, build_optimizer
-from nemo_automodel.engine import Engine, collate_prebatched
+from nemo_automodel.engine import Engine
 from tensordict import TensorDict
 from torch.distributed.checkpoint.state_dict import get_model_state_dict
 from torch.distributed.tensor import DTensor, Replicate, Shard
@@ -253,20 +252,14 @@ class AutomodelEngine(BaseEngine):
             self.optimizer = None
             self.lr_scheduler = None
 
-        pad_token_id = getattr(self.model_config.tokenizer, "pad_token_id", 0) or 0
-        self.execution_engine = Engine(
+        self.training_engine = Engine(
             self.module,
-            device=torch.device(get_device_name(), get_device_id()),
-            mesh_context=self.distributed_setup.mesh_context,
-            microbatch_size=1,
-            collate_fn=collate_prebatched,
-            padding_token_id=pad_token_id,
-            context_fn=lambda _inputs: torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16),
-            defer_fsdp_grad_sync=self.engine_config.defer_fsdp_grad_sync,
-            optimizers=self.optimizer,
+            optimizer=self.optimizer,
             # veRL advances and checkpoints its scheduler separately.
-            lr_schedulers=None,
+            lr_scheduler=None,
+            mesh_context=self.distributed_setup.mesh_context,
             max_grad_norm=self.optimizer_config.clip_grad,
+            defer_fsdp_grad_sync=self.engine_config.defer_fsdp_grad_sync,
         )
         self._build_checkpointer()
 
@@ -349,7 +342,6 @@ class AutomodelEngine(BaseEngine):
                     "packed AutoModel batches require a live custom TE backend or resolved HF FlashAttention 2; "
                     f"got custom={custom_attention!r}, resolved={loaded_attention!r}"
                 )
-        self._use_indexed_packing = self._packing_layout == "indexed_mask"
         return model
 
     def _build_optimizer(self, module):
@@ -435,82 +427,55 @@ class AutomodelEngine(BaseEngine):
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
 
-        dp_size = self.get_data_parallel_size()
-        num_micro_batches = len(micro_batches)
-        datums = []
-        prepared_batches = []
-        output_args_list = []
-        for index, micro_batch in enumerate(micro_batches):
+        if not forward_only:
+            # The last microbatch is the accumulation boundary: there the engine
+            # syncs deferred FSDP gradients, clips, and runs the optimizer.
+            self.training_engine.set_gradient_accumulation_steps(len(micro_batches))
+
+        output_lst = []
+        for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
-            model_inputs, output_args = self.prepare_model_inputs(micro_batch)
-            token_template = model_inputs.get("input_ids", model_inputs.get("inputs_embeds"))
-            if not isinstance(token_template, torch.Tensor) or token_template.ndim < 2:
-                raise ValueError("AutoModel inputs must contain a batched token tensor")
-            token_shape = token_template.shape[:2]
-            token_count = token_template.shape[0] * token_template.shape[1]
-            if token_count == 0:
-                raise ValueError("AutoModel cannot execute an empty microbatch")
-
-            # The sum is 1 / dp_size over the complete window. Engine therefore
-            # normalizes the caller's already-scaled veRL scalar without changing
-            # its gradient under averaged or summed data-parallel reductions.
-            weights = torch.full(
-                token_shape,
-                1.0 / (dp_size * num_micro_batches * token_count),
-                dtype=torch.float32,
-                device=token_template.device,
-            )
-            datums.append(
-                Datum(
-                    model_inputs=model_inputs,
-                    loss_fn_inputs={
-                        "weights": weights,
-                        "_verl_microbatch_index": torch.tensor(index, device=token_template.device),
-                    },
-                    loss_fn_input_layouts={
-                        "weights": LossInputLayout.PER_TOKEN,
-                        "_verl_microbatch_index": LossInputLayout.REPLICATED,
-                    },
-                )
-            )
-            prepared_batches.append(micro_batch)
-            output_args_list.append(output_args)
-
-        def engine_loss_fn(raw_output, loss_inputs):
-            index = int(loss_inputs["_verl_microbatch_index"].item())
-            micro_batch = prepared_batches[index]
-            model_output = self.prepare_model_outputs(raw_output, output_args_list[index], micro_batch)
-            if loss_function is None:
-                if not forward_only:
+            model_inputs, token_metadata = self.prepare_model_inputs(micro_batch)
+            grad_ctx = torch.no_grad() if forward_only else nullcontext()
+            with grad_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                output = self.training_engine(**model_inputs)
+                model_output = self.prepare_model_outputs(output, token_metadata, micro_batch)
+                if loss_function is not None:
+                    loss, metrics = loss_function(
+                        model_output=model_output,
+                        data=micro_batch,
+                        dp_group=self.get_data_parallel_group(),
+                    )
+                elif forward_only:
+                    loss, metrics = torch.ones((), device=get_device_id()), {}
+                else:
                     raise ValueError("training requires a loss function")
-                loss = torch.ones((), device=loss_inputs["weights"].device)
-                metrics = {}
-            else:
-                loss, metrics = loss_function(
-                    model_output=model_output,
-                    data=micro_batch,
-                    dp_group=self.get_data_parallel_group(),
-                )
-            record = {"loss": loss.detach().item(), "metrics": metrics}
-            if forward_only or tu.get_non_tensor_data(data=micro_batch, key="return_model_output", default=False):
-                record["model_output"] = model_output
-            return loss / dp_size, [record]
 
-        if forward_only:
-            result = self.execution_engine.forward(datums, engine_loss_fn)
-        else:
-            result = self.execution_engine.forward_backward(
-                datums,
-                engine_loss_fn,
-                accumulate_gradients=True,
-            )
-        return postprocess_batch_func(output_lst=result.loss_fn_outputs, indices=indices, data=data)
+            if not forward_only:
+                # veRL loss functions already normalize over the complete
+                # accumulation window (batch_num_tokens spans DP and all
+                # microbatches), so the engine must not scale by the window.
+                self.training_engine.backward(loss, scale_wrt_gas=False)
+                self.training_engine.step()
+
+            batch_output = {"loss": loss.detach().item(), "metrics": metrics}
+            if forward_only or tu.get_non_tensor_data(data=micro_batch, key="return_model_output", default=False):
+                batch_output["model_output"] = model_output
+            output_lst.append(batch_output)
+
+        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def optimizer_zero_grad(self):
         self.optimizer.zero_grad()
 
     def optimizer_step(self):
-        grad_norm = self.execution_engine.optim_step().grad_norm
+        """Return the gradient norm of the update that closed the last window.
+
+        The engine clips and steps at the accumulation boundary inside
+        ``forward_backward_batch``; unlike the FSDP engine there is no
+        non-finite-norm skip, matching AutoModel's own recipes.
+        """
+        grad_norm = self.training_engine.get_global_grad_norm()
         return grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
 
     def lr_scheduler_step(self):
@@ -821,7 +786,8 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
         ]
         if unsupported_outputs:
             raise NotImplementedError(f"AutoModel veRL has not integrated output processing for {unsupported_outputs}")
-        assert pad_mode == DatasetPadMode.NO_PADDING, f"pad_mode {pad_mode} not supported"
+        if pad_mode != DatasetPadMode.NO_PADDING:
+            raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
         multi_modal_inputs = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
         input_ids = micro_batch["input_ids"]
@@ -833,95 +799,89 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
         temperature = temperature.to(torch.float32)
         assert temperature.shape[0] == input_ids.shape[0]
 
-        output_args = {
-            "input_ids_rmpad_rolled": torch.roll(input_ids.values(), shifts=-1, dims=0),
-            "temperature_rmpad": verl_F.expand_as_nested(temperature, input_ids).values(),
+        token_metadata = {
+            "target_tokens": torch.roll(input_ids.values(), shifts=-1, dims=0),
+            "token_temperatures": verl_F.expand_as_nested(temperature, input_ids).values(),
         }
 
         if use_remove_padding:
-            if pad_mode == DatasetPadMode.NO_PADDING:
-                input_ids_rmpad = input_ids.values().unsqueeze(0)
-                if position_ids.dim() == 3:
-                    position_ids_rmpad = position_ids.values().unsqueeze(1)
-                else:
-                    position_ids_rmpad = position_ids.values().unsqueeze(0)
+            packed_input_ids = input_ids.values().unsqueeze(0)
+            if position_ids.dim() == 3:
+                packed_position_ids = position_ids.values().unsqueeze(1)
             else:
-                raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+                packed_position_ids = position_ids.values().unsqueeze(0)
 
-            output_args["token_count"] = input_ids_rmpad.shape[1]
+            token_metadata["original_token_count"] = packed_input_ids.shape[1]
 
             model_inputs = {
-                "input_ids": input_ids_rmpad,
+                "input_ids": packed_input_ids,
                 "attention_mask": None,
-                "position_ids": position_ids_rmpad,
+                "position_ids": packed_position_ids,
             }
 
-            # Engine owns final THD metadata and any HybridEP token equalization.
+            # AutoModel's dispatcher equalizes HybridEP token counts internally;
+            # only the THD sequence metadata is assembled here.
             if self._packing_layout == "thd":
-                seq_lens = input_ids.offsets().diff().to(torch.int32).unsqueeze(0)
+                sequence_lengths = input_ids.offsets().diff().to(torch.int32).unsqueeze(0)
                 model_inputs["qkv_format"] = "thd"
-                model_inputs["seq_lens"] = seq_lens
-                model_inputs["seq_lens_padded"] = seq_lens.clone()
-            elif self._use_indexed_packing:
-                seq_lens = input_ids.offsets().diff()
-                packed_seq_ids = torch.repeat_interleave(
-                    torch.arange(1, seq_lens.numel() + 1, device=input_ids_rmpad.device),
-                    seq_lens.to(input_ids_rmpad.device),
+                model_inputs["seq_lens"] = sequence_lengths
+                model_inputs["seq_lens_padded"] = sequence_lengths.clone()
+            elif self._packing_layout == "indexed_mask":
+                sequence_lengths = input_ids.offsets().diff()
+                indexed_attention_mask = torch.repeat_interleave(
+                    torch.arange(1, sequence_lengths.numel() + 1, device=packed_input_ids.device),
+                    sequence_lengths.to(packed_input_ids.device),
                 ).unsqueeze(0)
-                model_inputs["attention_mask"] = packed_seq_ids
+                model_inputs["attention_mask"] = indexed_attention_mask
 
         else:
-            if pad_mode == DatasetPadMode.NO_PADDING:
-                input_ids = micro_batch["input_ids"]
-                position_ids = micro_batch["position_ids"]
-                pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
-                batch_size = micro_batch.batch_size[0]
-                seq_len_effective = input_ids.offsets().diff()
-                max_seq_len = max(seq_len_effective)
+            input_ids = micro_batch["input_ids"]
+            position_ids = micro_batch["position_ids"]
+            pad_token_id = tu.get_non_tensor_data(data=micro_batch, key="pad_token_id", default=0)
+            batch_size = micro_batch.batch_size[0]
+            sequence_lengths = input_ids.offsets().diff()
+            max_sequence_length = max(sequence_lengths)
 
-                input_ids = torch.nested.to_padded_tensor(
-                    input_ids, padding=pad_token_id, output_size=(batch_size, max_seq_len)
-                )
+            input_ids = torch.nested.to_padded_tensor(
+                input_ids, padding=pad_token_id, output_size=(batch_size, max_sequence_length)
+            )
 
-                if position_ids.dim() == 3:
-                    position_ids = torch.nested.to_padded_tensor(
-                        position_ids, padding=0, output_size=(batch_size, 4, max_seq_len)
-                    ).transpose(0, 1)
-                else:
-                    position_ids = torch.nested.to_padded_tensor(
-                        position_ids, padding=0, output_size=(batch_size, max_seq_len)
-                    )
-
-                attention_mask = build_attention_mask_from_nested(
-                    input_ids=micro_batch["input_ids"], max_seq_len=max_seq_len
-                )
-
-                model_inputs = {
-                    "input_ids": input_ids,
-                    "attention_mask": attention_mask,
-                    "position_ids": position_ids,
-                }
-                output_args["padded_width"] = input_ids.shape[1]
-
+            if position_ids.dim() == 3:
+                position_ids = torch.nested.to_padded_tensor(
+                    position_ids, padding=0, output_size=(batch_size, 4, max_sequence_length)
+                ).transpose(0, 1)
             else:
-                raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+                position_ids = torch.nested.to_padded_tensor(
+                    position_ids, padding=0, output_size=(batch_size, max_sequence_length)
+                )
+
+            attention_mask = build_attention_mask_from_nested(
+                input_ids=micro_batch["input_ids"], max_seq_len=max_sequence_length
+            )
+
+            model_inputs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            }
+            token_metadata["padded_sequence_length"] = input_ids.shape[1]
 
         model_inputs["use_cache"] = False
         model_inputs.update(multi_modal_inputs)
 
-        return model_inputs, output_args
+        return model_inputs, token_metadata
 
-    def _token_statistics(self, logits, targets, temperature, calculate_entropy):
-        temperature = temperature.clamp(min=1e-8)
-        if tuple(logits.shape[:-1]) != tuple(targets.shape) or tuple(targets.shape) != tuple(temperature.shape):
+    def _compute_token_statistics(self, logits, targets, token_temperatures, calculate_entropy):
+        token_temperatures = token_temperatures.clamp(min=1e-8)
+        if tuple(logits.shape[:-1]) != tuple(targets.shape) or tuple(targets.shape) != tuple(token_temperatures.shape):
             raise ValueError(
-                "logits, targets, and temperature must share token axes; "
-                f"got {tuple(logits.shape)}, {tuple(targets.shape)}, and {tuple(temperature.shape)}"
+                "logits, targets, and token temperatures must share token axes; "
+                f"got {tuple(logits.shape)}, {tuple(targets.shape)}, and {tuple(token_temperatures.shape)}"
             )
 
         if isinstance(logits, DTensor):
             local_logits = logits.to_local()
-            scaled_local = local_logits / temperature.unsqueeze(-1).to(local_logits.dtype)
+            scaled_local = local_logits / token_temperatures.unsqueeze(-1).to(local_logits.dtype)
             scaled_logits = DTensor.from_local(
                 scaled_local,
                 logits.device_mesh,
@@ -930,11 +890,11 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
                 shape=logits.shape,
                 stride=logits.stride(),
             )
-            log_probs = vocab_parallel_log_probs(scaled_logits, targets)
-            entropy = vocab_parallel_entropy(scaled_logits) if calculate_entropy else None
+            log_probs = token_log_probs(scaled_logits, targets)
+            entropy = token_entropy(scaled_logits) if calculate_entropy else None
             return log_probs, entropy
 
-        scaled_logits = logits / temperature.unsqueeze(-1).to(logits.dtype)
+        scaled_logits = logits / token_temperatures.unsqueeze(-1).to(logits.dtype)
         log_probs = logprobs_from_logits(
             logits=scaled_logits,
             labels=targets,
@@ -953,7 +913,7 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
             entropy = self.compute_entropy_from_logits(scaled_logits)
         return log_probs, entropy
 
-    def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict):
+    def prepare_model_outputs(self, output, token_metadata, micro_batch: TensorDict):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
         use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
@@ -963,33 +923,21 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
         if pad_mode != DatasetPadMode.NO_PADDING:
             raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
-        if isinstance(output, torch.Tensor):
-            from types import SimpleNamespace
-
-            output = SimpleNamespace(logits=output)
-
+        logits = output if isinstance(output, torch.Tensor) else output.logits
         input_ids = micro_batch["input_ids"]
-        cu_seqlens = input_ids.offsets()
+        nested_offsets = input_ids.offsets()
         if use_remove_padding:
-            token_count = output_args["token_count"]
-            logits = output.logits.squeeze(0)[:token_count]
-            log_probs_rmpad, entropy_rmpad = self._token_statistics(
-                logits,
-                output_args["input_ids_rmpad_rolled"],
-                output_args["temperature_rmpad"],
-                calculate_entropy,
-            )
-            log_probs = torch.nested.nested_tensor_from_jagged(log_probs_rmpad, cu_seqlens)
-            entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens) if calculate_entropy else None
+            original_token_count = token_metadata["original_token_count"]
+            flat_logits = logits.squeeze(0)[:original_token_count]
         else:
-            original_width = output_args["padded_width"]
-            logits = output.logits[:, :original_width]
-            seq_lengths = cu_seqlens.diff()
-            valid_mask = torch.arange(original_width, device=logits.device).unsqueeze(0) < seq_lengths.to(
-                logits.device
-            ).unsqueeze(1)
+            padded_sequence_length = token_metadata["padded_sequence_length"]
+            logits = logits[:, :padded_sequence_length]
+            sequence_lengths = nested_offsets.diff()
+            valid_token_mask = torch.arange(padded_sequence_length, device=logits.device).unsqueeze(
+                0
+            ) < sequence_lengths.to(logits.device).unsqueeze(1)
             if isinstance(logits, DTensor):
-                local_logits = logits.to_local()[valid_mask]
+                local_logits = logits.to_local()[valid_token_mask]
                 flat_placements = []
                 for placement in logits.placements:
                     if isinstance(placement, Shard):
@@ -1005,26 +953,26 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
                             f"unpacked AutoModel logits do not support DTensor placement {placement!r}"
                         )
                 vocab_size = logits.shape[-1]
-                logits = DTensor.from_local(
+                flat_logits = DTensor.from_local(
                     local_logits,
                     logits.device_mesh,
                     tuple(flat_placements),
                     run_check=False,
-                    shape=(output_args["input_ids_rmpad_rolled"].numel(), vocab_size),
+                    shape=(token_metadata["target_tokens"].numel(), vocab_size),
                     stride=(vocab_size, 1),
                 )
             else:
-                logits = logits[valid_mask]
-            log_probs_rmpad, entropy_rmpad = self._token_statistics(
-                logits,
-                output_args["input_ids_rmpad_rolled"],
-                output_args["temperature_rmpad"],
-                calculate_entropy,
-            )
-            log_probs = torch.nested.nested_tensor_from_jagged(log_probs_rmpad, cu_seqlens)
-            entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens) if calculate_entropy else None
+                flat_logits = logits[valid_token_mask]
+
+        flat_log_probs, flat_entropy = self._compute_token_statistics(
+            flat_logits,
+            token_metadata["target_tokens"],
+            token_metadata["token_temperatures"],
+            calculate_entropy,
+        )
+        log_probs = torch.nested.nested_tensor_from_jagged(flat_log_probs, nested_offsets)
 
         model_output = {"log_probs": log_probs}
         if calculate_entropy:
-            model_output["entropy"] = entropy
+            model_output["entropy"] = torch.nested.nested_tensor_from_jagged(flat_entropy, nested_offsets)
         return model_output

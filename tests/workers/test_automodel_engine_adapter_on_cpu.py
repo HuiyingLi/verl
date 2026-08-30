@@ -26,26 +26,25 @@ from verl.workers.engine.automodel import transformer_impl
 from verl.workers.engine.automodel.transformer_impl import AutomodelEngine, AutomodelEngineWithLMHead
 
 
-class _RecordingExecutionEngine:
+class _RecordingTrainingEngine:
+    """Stand-in for nemo_automodel.engine.Engine with the DeepSpeed-style surface."""
+
     def __init__(self):
-        self.calls = []
-        self.callback_numerators = []
+        self.gas_calls = []
+        self.backward_calls = []
+        self.step_calls = 0
 
-    def _run(self, name, datums, loss_fn, **kwargs):
-        self.calls.append((name, datums, kwargs))
-        records = []
-        for datum in datums:
-            raw_output = datum.model_inputs["input_ids"].sum()
-            numerator, datum_records = loss_fn(raw_output, datum.loss_fn_inputs)
-            self.callback_numerators.append(numerator.detach())
-            records.extend(datum_records)
-        return SimpleNamespace(loss_fn_outputs=records)
+    def __call__(self, **model_inputs):
+        return model_inputs["input_ids"].sum()
 
-    def forward(self, datums, loss_fn, **kwargs):
-        return self._run("forward", datums, loss_fn, **kwargs)
+    def set_gradient_accumulation_steps(self, steps):
+        self.gas_calls.append(steps)
 
-    def forward_backward(self, datums, loss_fn, **kwargs):
-        return self._run("forward_backward", datums, loss_fn, **kwargs)
+    def backward(self, loss, retain_graph=False, scale_wrt_gas=True):
+        self.backward_calls.append((loss.detach(), scale_wrt_gas))
+
+    def step(self):
+        self.step_calls += 1
 
 
 def _microbatch(token: int) -> TensorDict:
@@ -83,29 +82,27 @@ def _packed_microbatch() -> TensorDict:
 
 
 @pytest.mark.parametrize(
-    ("forward_only", "return_model_output", "expected_call", "expected_kwargs", "keeps_model_output"),
+    ("forward_only", "return_model_output", "keeps_model_output"),
     [
-        (True, False, "forward", {}, True),
-        (False, False, "forward_backward", {"accumulate_gradients": True}, False),
-        (False, True, "forward_backward", {"accumulate_gradients": True}, True),
+        (True, False, True),
+        (False, False, False),
+        (False, True, True),
     ],
 )
-def test_window_is_one_engine_call_and_preserves_verl_scaling(
+def test_forward_backward_drives_one_engine_microstep_per_microbatch(
     monkeypatch,
     forward_only,
     return_model_output,
-    expected_call,
-    expected_kwargs,
     keeps_model_output,
 ):
     microbatches = [_microbatch(2), _microbatch(5)]
     for microbatch in microbatches:
         tu.assign_non_tensor(microbatch, return_model_output=return_model_output)
     data = TensorDict({"loss_mask": torch.ones(2)}, batch_size=[2])
-    execution_engine = _RecordingExecutionEngine()
+    training_engine = _RecordingTrainingEngine()
 
     engine = object.__new__(AutomodelEngineWithLMHead)
-    engine.execution_engine = execution_engine
+    engine.training_engine = training_engine
     engine.prepare_model_inputs = lambda micro_batch: (
         {"input_ids": micro_batch["token"].reshape(1, 1)},
         {},
@@ -115,6 +112,7 @@ def test_window_is_one_engine_call_and_preserves_verl_scaling(
     engine.get_data_parallel_size = lambda: 4
 
     monkeypatch.setattr(transformer_impl, "get_device_id", lambda: "cpu")
+    monkeypatch.setattr(transformer_impl, "get_device_name", lambda: "cpu")
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         transformer_impl,
@@ -140,14 +138,19 @@ def test_window_is_one_engine_call_and_preserves_verl_scaling(
         forward_only=forward_only,
     )
 
-    assert len(execution_engine.calls) == 1
-    call_name, datums, call_kwargs = execution_engine.calls[0]
-    assert call_name == expected_call
-    assert call_kwargs == expected_kwargs
     assert seen_tokens == [2, 5]
-    assert [int(datum.loss_fn_inputs["_verl_microbatch_index"]) for datum in datums] == [0, 1]
-    assert [datum.loss_fn_inputs["weights"].sum().item() for datum in datums] == pytest.approx([1 / 8, 1 / 8])
-    assert [value.item() for value in execution_engine.callback_numerators] == pytest.approx([2.5, 3.25])
+    if forward_only:
+        # Scoring never touches the training state machine.
+        assert training_engine.gas_calls == []
+        assert training_engine.backward_calls == []
+        assert training_engine.step_calls == 0
+    else:
+        # One accumulation window per veRL mini-batch; every microbatch is one
+        # engine microstep with veRL's own normalization passed through raw.
+        assert training_engine.gas_calls == [2]
+        assert [loss.item() for loss, _ in training_engine.backward_calls] == pytest.approx([10.0, 13.0])
+        assert all(scale_wrt_gas is False for _, scale_wrt_gas in training_engine.backward_calls)
+        assert training_engine.step_calls == 2
     assert [record["loss"] for record in outputs] == pytest.approx([10.0, 13.0])
     assert [("model_output" in record) for record in outputs] == [keeps_model_output, keeps_model_output]
     assert torch.equal(indices, torch.tensor([1, 0]))
@@ -170,28 +173,28 @@ def test_optimizer_and_scheduler_stay_on_their_owners():
         def step(self, increment):
             self.increments.append(increment)
 
-    class ExecutionEngine:
+    class TrainingEngine:
         def __init__(self):
-            self.optim_step_calls = 0
+            self.norm_reads = 0
 
-        def optim_step(self):
-            self.optim_step_calls += 1
-            return SimpleNamespace(grad_norm=torch.tensor(3.5))
+        def get_global_grad_norm(self):
+            self.norm_reads += 1
+            return torch.tensor(3.5)
 
     engine = object.__new__(AutomodelEngine)
     engine.optimizer = Optimizer()
     engine.lr_scheduler = Scheduler()
-    engine.execution_engine = ExecutionEngine()
+    engine.training_engine = TrainingEngine()
 
     AutomodelEngine.optimizer_zero_grad(engine)
     assert AutomodelEngine.optimizer_step(engine) == 3.5
     assert AutomodelEngine.lr_scheduler_step(engine) == 0.25
     assert engine.optimizer.zero_grad_calls == 1
-    assert engine.execution_engine.optim_step_calls == 1
+    assert engine.training_engine.norm_reads == 1
     assert engine.lr_scheduler.increments == [1]
 
 
-def test_initialize_keeps_scheduler_out_of_execution_engine(monkeypatch):
+def test_initialize_keeps_scheduler_out_of_training_engine(monkeypatch):
     module = torch.nn.Linear(2, 2)
     optimizer = torch.optim.SGD(module.parameters(), lr=0.1)
     scheduler = object()
@@ -211,12 +214,12 @@ def test_initialize_keeps_scheduler_out_of_execution_engine(monkeypatch):
     engine._build_checkpointer = lambda: None
     engine.to = lambda **kwargs: None
 
-    def build_execution_engine(*args, **kwargs):
+    def build_training_engine(*args, **kwargs):
         captured["args"] = args
         captured["kwargs"] = kwargs
         return object()
 
-    monkeypatch.setattr(transformer_impl, "Engine", build_execution_engine)
+    monkeypatch.setattr(transformer_impl, "Engine", build_training_engine)
     monkeypatch.setattr(transformer_impl, "maybe_shard_optimizer", lambda _model, optim, _config: optim)
     monkeypatch.setattr(transformer_impl, "get_device_name", lambda: "cpu")
     monkeypatch.setattr(transformer_impl, "get_device_id", lambda: 0)
@@ -226,8 +229,10 @@ def test_initialize_keeps_scheduler_out_of_execution_engine(monkeypatch):
     AutomodelEngine.initialize(engine)
 
     assert captured["args"] == (module,)
-    assert captured["kwargs"]["optimizers"] is optimizer
-    assert captured["kwargs"]["lr_schedulers"] is None
+    assert captured["kwargs"]["optimizer"] is optimizer
+    assert captured["kwargs"]["lr_scheduler"] is None
+    assert captured["kwargs"]["max_grad_norm"] == 1.0
+    assert captured["kwargs"]["mesh_context"] is engine.distributed_setup.mesh_context
     assert engine.lr_scheduler is scheduler
 
 
@@ -236,13 +241,12 @@ def test_remove_padding_uses_raw_thd_or_indexed_mask(attention):
     engine = object.__new__(AutomodelEngineWithLMHead)
     engine.engine_config = SimpleNamespace(attn_implementation=attention)
     engine._packing_layout = "thd" if attention == "te" else "indexed_mask"
-    engine._use_indexed_packing = attention != "te"
 
     model_inputs, output_args = AutomodelEngineWithLMHead.prepare_model_inputs(engine, _packed_microbatch())
 
     torch.testing.assert_close(model_inputs["input_ids"], torch.tensor([[10, 11, 12, 20, 21]]))
     torch.testing.assert_close(model_inputs["position_ids"], torch.tensor([[0, 1, 2, 0, 1]]))
-    assert output_args["token_count"] == 5
+    assert output_args["original_token_count"] == 5
     assert "cu_seqlens" not in model_inputs
     assert "max_seqlen" not in model_inputs
     if attention == "te":
@@ -293,7 +297,7 @@ def test_unpacked_outputs_use_flat_jagged_logits_and_one_global_target_roll():
         seen.update(logits=logits, targets=targets, temperature=temperature)
         return torch.arange(5, dtype=torch.float32), None
 
-    engine._token_statistics = token_statistics
+    engine._compute_token_statistics = token_statistics
     logits = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
     output = AutomodelEngineWithLMHead.prepare_model_outputs(engine, SimpleNamespace(logits=logits), output_args, batch)
 
@@ -368,9 +372,9 @@ def test_unpacked_tp_logits_remap_vocab_shard_after_flatten(monkeypatch, vocab_s
     batch = _packed_microbatch()
     tu.assign_non_tensor(batch, use_remove_padding=False)
     output_args = {
-        "padded_width": 3,
-        "input_ids_rmpad_rolled": torch.tensor([11, 12, 20, 21, 10]),
-        "temperature_rmpad": torch.ones(5),
+        "padded_sequence_length": 3,
+        "target_tokens": torch.tensor([11, 12, 20, 21, 10]),
+        "token_temperatures": torch.ones(5),
     }
     seen = {}
 
@@ -378,7 +382,7 @@ def test_unpacked_tp_logits_remap_vocab_shard_after_flatten(monkeypatch, vocab_s
         seen["logits"] = logits
         return torch.arange(5, dtype=torch.float32), None
 
-    engine._token_statistics = token_statistics
+    engine._compute_token_statistics = token_statistics
     local_logits = torch.arange(2 * 3 * 2, dtype=torch.float32).reshape(2, 3, 2)
     logits = FakeDTensor(local_logits, (FakeReplicate(), FakeShard(vocab_shard_dim)), shape=(2, 3, 4))
 
@@ -440,7 +444,6 @@ def test_flash_attention_model_enables_indexed_packing(monkeypatch):
     assert loaded["use_liger_kernel"] is False
     assert configured == ["flash_attention_2"]
     assert engine._packing_layout == "indexed_mask"
-    assert engine._use_indexed_packing is True
 
 
 def test_dtensor_token_statistics_delegate_to_vocab_parallel_primitives(monkeypatch):
@@ -475,13 +478,13 @@ def test_dtensor_token_statistics_delegate_to_vocab_parallel_primitives(monkeypa
         return torch.tensor([0.25, 0.75])
 
     monkeypatch.setattr(transformer_impl, "DTensor", FakeDTensor)
-    monkeypatch.setattr(transformer_impl, "vocab_parallel_log_probs", selected)
-    monkeypatch.setattr(transformer_impl, "vocab_parallel_entropy", entropy)
+    monkeypatch.setattr(transformer_impl, "token_log_probs", selected)
+    monkeypatch.setattr(transformer_impl, "token_entropy", entropy)
 
     engine = object.__new__(AutomodelEngineWithLMHead)
     logits = FakeDTensor(torch.tensor([[2.0, 4.0, 6.0], [4.0, 8.0, 12.0]]))
     targets = torch.tensor([1, 2])
-    log_probs, token_entropy = AutomodelEngineWithLMHead._token_statistics(
+    log_probs, token_entropy = AutomodelEngineWithLMHead._compute_token_statistics(
         engine,
         logits,
         targets,
