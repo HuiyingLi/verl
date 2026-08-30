@@ -867,20 +867,16 @@ def test_checkpoint_hdfs_fails_closed(method):
         getattr(AutomodelEngine, method)(engine, "/tmp/local", hdfs_path="hdfs://checkpoint")
 
 
-def test_forward_backward_batch_updates_parameters_through_a_real_engine(monkeypatch, tmp_path):
+def test_forward_backward_batch_updates_parameters_through_a_real_engine(monkeypatch):
     """One veRL mini-batch through the real nemo-automodel Engine on CPU.
 
     The mock-based window test above pins the adapter's call sequence; this one
-    proves the sequence is what the real Engine expects: two microbatches
-    accumulate, the boundary microstep clips and runs the optimizer exactly
-    once, and the parameters move.
+    proves the sequence is what the real Engine expects: the accumulated
+    gradient equals plain ``sum_i loss_i.backward()`` (the FSDP reference
+    semantics), the pending boundary microstep runs the optimizer exactly once
+    in ``optimizer_step``, and a failed window resets cleanly for a retry.
     """
     from nemo_automodel.engine import Engine
-
-    if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group(
-            "gloo", init_method=f"file://{tmp_path}/pg", rank=0, world_size=1
-        )
 
     class TinyLM(torch.nn.Module):
         def __init__(self):
@@ -912,6 +908,7 @@ def test_forward_backward_batch_updates_parameters_through_a_real_engine(monkeyp
 
     monkeypatch.setattr(transformer_impl, "get_device_id", lambda: "cpu")
     monkeypatch.setattr(transformer_impl, "get_device_name", lambda: "cpu")
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         transformer_impl,
         "prepare_micro_batches",
@@ -923,13 +920,35 @@ def test_forward_backward_batch_updates_parameters_through_a_real_engine(monkeyp
         lambda output_lst, indices, data: output_lst,
     )
 
+    def verl_loss(model_output, data, dp_group):
+        return model_output["value"].square().mean(), {}
+
+    # Reference: the FSDP engine's semantics are plain summed loss.backward(),
+    # with the forward and loss under the same bf16 autocast the adapter uses.
+    reference = TinyLM()
+    reference.load_state_dict(model.state_dict())
+    for micro_batch in microbatches:
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            reference_loss = reference(micro_batch["token"]).square().mean()
+        reference_loss.backward()
+
     model.train()
-    outputs = AutomodelEngine.forward_backward_batch(
-        engine,
-        data,
-        lambda model_output, data, dp_group: (model_output["value"].square().mean(), {}),
-        forward_only=False,
-    )
+
+    # A window that fails mid-microbatch resets and must not poison the retry.
+    calls = {"n": 0}
+
+    def failing_loss(model_output, data, dp_group):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated OOM")
+        return verl_loss(model_output, data, dp_group)
+
+    with pytest.raises(RuntimeError, match="simulated OOM"):
+        AutomodelEngine.forward_backward_batch(engine, data, failing_loss, forward_only=False)
+    assert not engine._window_open
+
+    outputs = AutomodelEngine.forward_backward_batch(engine, data, verl_loss, forward_only=False)
+    torch.testing.assert_close(model.proj.weight.grad, reference.proj.weight.grad)
 
     grad_norm = AutomodelEngine.optimizer_step(engine)
     assert len(outputs) == 2

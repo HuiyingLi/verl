@@ -480,7 +480,12 @@ class AutomodelEngine(BaseEngine):
 
                 batch_output = {"loss": loss.detach().item(), "metrics": metrics}
                 if forward_only or tu.get_non_tensor_data(data=micro_batch, key="return_model_output", default=False):
-                    batch_output["model_output"] = model_output
+                    # Keeping grad_fns alive would retain part of every
+                    # microbatch's autograd graph until the window finishes.
+                    batch_output["model_output"] = {
+                        key: value.detach() if torch.is_tensor(value) and value.grad_fn is not None else value
+                        for key, value in model_output.items()
+                    }
                 output_lst.append(batch_output)
         except Exception:
             # A failed microstep (e.g. OOM) must not poison the next window.
