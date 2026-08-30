@@ -839,3 +839,73 @@ def test_checkpoint_hdfs_fails_closed(method):
     engine = object.__new__(AutomodelEngine)
     with pytest.raises(NotImplementedError, match="HDFS"):
         getattr(AutomodelEngine, method)(engine, "/tmp/local", hdfs_path="hdfs://checkpoint")
+
+
+def test_forward_backward_batch_updates_parameters_through_a_real_engine(monkeypatch, tmp_path):
+    """One veRL mini-batch through the real nemo-automodel Engine on CPU.
+
+    The mock-based window test above pins the adapter's call sequence; this one
+    proves the sequence is what the real Engine expects: two microbatches
+    accumulate, the boundary microstep clips and runs the optimizer exactly
+    once, and the parameters move.
+    """
+    from nemo_automodel.engine import Engine
+
+    if not torch.distributed.is_initialized():
+        torch.distributed.init_process_group(
+            "gloo", init_method=f"file://{tmp_path}/pg", rank=0, world_size=1
+        )
+
+    class TinyLM(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(4, 4, bias=False)
+
+        def forward(self, input_ids):
+            return self.proj(input_ids)
+
+    torch.manual_seed(0)
+    model = TinyLM()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    initial_weight = model.proj.weight.detach().clone()
+
+    engine = object.__new__(AutomodelEngineWithLMHead)
+    engine.training_engine = Engine(model, optimizer=optimizer, max_grad_norm=1.0)
+    engine.prepare_model_inputs = lambda micro_batch: ({"input_ids": micro_batch["token"]}, {})
+    engine.prepare_model_outputs = lambda raw_output, _args, _micro_batch: {"value": raw_output}
+    engine.get_data_parallel_group = lambda: None
+    engine.get_data_parallel_size = lambda: 1
+
+    microbatches = [
+        TensorDict({"token": torch.randn(2, 4)}, batch_size=[2]),
+        TensorDict({"token": torch.randn(2, 4)}, batch_size=[2]),
+    ]
+    data = TensorDict({"loss_mask": torch.ones(4)}, batch_size=[4])
+
+    monkeypatch.setattr(transformer_impl, "get_device_id", lambda: "cpu")
+    monkeypatch.setattr(transformer_impl, "get_device_name", lambda: "cpu")
+    monkeypatch.setattr(
+        transformer_impl,
+        "prepare_micro_batches",
+        lambda **kwargs: (microbatches, torch.tensor([0, 1, 2, 3])),
+    )
+    monkeypatch.setattr(
+        transformer_impl,
+        "postprocess_batch_func",
+        lambda output_lst, indices, data: output_lst,
+    )
+
+    model.train()
+    outputs = AutomodelEngine.forward_backward_batch(
+        engine,
+        data,
+        lambda model_output, data, dp_group: (model_output["value"].square().mean(), {}),
+        forward_only=False,
+    )
+
+    grad_norm = AutomodelEngine.optimizer_step(engine)
+    assert len(outputs) == 2
+    assert grad_norm > 0.0
+    assert not torch.equal(model.proj.weight.detach(), initial_weight)
+    # The boundary already cleared gradients for the next window.
+    assert all(p.grad is None for p in model.parameters())
