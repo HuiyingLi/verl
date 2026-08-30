@@ -241,6 +241,10 @@ class AutomodelEngine(BaseEngine):
 
     def initialize(self):
         """Build the model and veRL-owned optimizer, scheduler, and checkpointer."""
+        if not self.engine_config.forward_only and self.optimizer_config.clip_grad is None:
+            # Without a bound the gradient finalizer reports a norm of 0.0
+            # instead of measuring one; veRL treats the norm as a real metric.
+            raise ValueError("AutoModel training requires optimizer.clip_grad to be set")
         self.module = self._build_model()
         log_gpu_memory_usage("After Automodel model build", logger=logger)
 
@@ -433,6 +437,10 @@ class AutomodelEngine(BaseEngine):
         if not forward_only:
             if loss_function is None:
                 raise ValueError("training requires a loss function")
+            if not self.module.training:
+                # Engine.forward would silently bypass gradient-sync deferral
+                # and MoE microbatch preparation for an eval-mode module.
+                raise RuntimeError("forward_backward_batch training requires train_mode()")
             if self._window_open:
                 raise NotImplementedError(
                     "the AutoModel engine accumulates one window per optimizer step; "

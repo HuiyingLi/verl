@@ -110,6 +110,7 @@ def test_forward_backward_drives_one_engine_microstep_per_microbatch(
 
     engine = object.__new__(AutomodelEngineWithLMHead)
     engine.training_engine = training_engine
+    engine.module = SimpleNamespace(training=True)
     engine._window_open = False
     engine.prepare_model_inputs = lambda micro_batch: (
         {"input_ids": micro_batch["token"].reshape(1, 1)},
@@ -896,6 +897,7 @@ def test_forward_backward_batch_updates_parameters_through_a_real_engine(monkeyp
 
     engine = object.__new__(AutomodelEngineWithLMHead)
     engine.training_engine = Engine(model, optimizer=optimizer, max_grad_norm=1.0)
+    engine.module = model
     engine._window_open = False
     engine.prepare_model_inputs = lambda micro_batch: ({"input_ids": micro_batch["token"]}, {})
     engine.prepare_model_outputs = lambda raw_output, _args, _micro_batch: {"value": raw_output}
@@ -942,6 +944,7 @@ def test_failed_microstep_resets_the_engine_window(monkeypatch):
 
     engine = object.__new__(AutomodelEngineWithLMHead)
     engine.training_engine = training_engine
+    engine.module = SimpleNamespace(training=True)
     engine._window_open = False
     engine.prepare_model_inputs = lambda micro_batch: ({"input_ids": micro_batch["token"].reshape(1, 1)}, {})
     engine.prepare_model_outputs = lambda raw_output, _args, _micro_batch: {"value": raw_output}
