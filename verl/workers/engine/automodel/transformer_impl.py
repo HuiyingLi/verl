@@ -261,6 +261,9 @@ class AutomodelEngine(BaseEngine):
             max_grad_norm=self.optimizer_config.clip_grad,
             defer_fsdp_grad_sync=self.engine_config.defer_fsdp_grad_sync,
         )
+        # True between forward_backward_batch and the optimizer_step that
+        # closes its accumulation window.
+        self._window_open = False
         self._build_checkpointer()
 
         self.to(
@@ -428,53 +431,76 @@ class AutomodelEngine(BaseEngine):
         )
 
         if not forward_only:
-            # The last microbatch is the accumulation boundary: there the engine
-            # syncs deferred FSDP gradients, clips, and runs the optimizer.
+            if loss_function is None:
+                raise ValueError("training requires a loss function")
+            if self._window_open:
+                raise NotImplementedError(
+                    "the AutoModel engine accumulates one window per optimizer step; "
+                    "call optimizer_step() before the next forward_backward_batch"
+                )
+            # The last microbatch is the boundary forward: the engine re-enables
+            # deferred FSDP gradient sync there so its backward reduces. The
+            # optimizer update itself waits for optimizer_step().
             self.training_engine.set_gradient_accumulation_steps(len(micro_batches))
+            self._window_open = True
 
         output_lst = []
-        for micro_batch in micro_batches:
-            micro_batch = micro_batch.to(get_device_id())
-            model_inputs, token_metadata = self.prepare_model_inputs(micro_batch)
-            grad_ctx = torch.no_grad() if forward_only else nullcontext()
-            with grad_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
-                output = self.training_engine(**model_inputs)
-                model_output = self.prepare_model_outputs(output, token_metadata, micro_batch)
-                if loss_function is not None:
-                    loss, metrics = loss_function(
-                        model_output=model_output,
-                        data=micro_batch,
-                        dp_group=self.get_data_parallel_group(),
-                    )
-                elif forward_only:
-                    loss, metrics = torch.ones((), device=get_device_id()), {}
-                else:
-                    raise ValueError("training requires a loss function")
+        try:
+            for index, micro_batch in enumerate(micro_batches):
+                micro_batch = micro_batch.to(get_device_id())
+                model_inputs, token_metadata = self.prepare_model_inputs(micro_batch)
+                grad_ctx = torch.no_grad() if forward_only else nullcontext()
+                with grad_ctx, torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                    output = self.training_engine(**model_inputs)
+                    model_output = self.prepare_model_outputs(output, token_metadata, micro_batch)
+                    if loss_function is not None:
+                        loss, metrics = loss_function(
+                            model_output=model_output,
+                            data=micro_batch,
+                            dp_group=self.get_data_parallel_group(),
+                        )
+                    else:
+                        loss, metrics = torch.ones((), device=get_device_id()), {}
 
+                if not forward_only:
+                    # veRL loss functions already normalize over the complete
+                    # accumulation window (batch_num_tokens spans DP and all
+                    # microbatches), so the engine must not scale by the window.
+                    self.training_engine.backward(loss, scale_wrt_gas=False)
+                    if index < len(micro_batches) - 1:
+                        self.training_engine.step()
+
+                batch_output = {"loss": loss.detach().item(), "metrics": metrics}
+                if forward_only or tu.get_non_tensor_data(data=micro_batch, key="return_model_output", default=False):
+                    batch_output["model_output"] = model_output
+                output_lst.append(batch_output)
+        except Exception:
+            # A failed microstep (e.g. OOM) must not poison the next window.
             if not forward_only:
-                # veRL loss functions already normalize over the complete
-                # accumulation window (batch_num_tokens spans DP and all
-                # microbatches), so the engine must not scale by the window.
-                self.training_engine.backward(loss, scale_wrt_gas=False)
-                self.training_engine.step()
-
-            batch_output = {"loss": loss.detach().item(), "metrics": metrics}
-            if forward_only or tu.get_non_tensor_data(data=micro_batch, key="return_model_output", default=False):
-                batch_output["model_output"] = model_output
-            output_lst.append(batch_output)
+                self._reset_accumulation_window()
+            raise
 
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+
+    def _reset_accumulation_window(self):
+        self.training_engine.reset_accumulation()
+        self._window_open = False
 
     def optimizer_zero_grad(self):
         self.optimizer.zero_grad()
 
     def optimizer_step(self):
-        """Return the gradient norm of the update that closed the last window.
+        """Close the accumulation window: finalize gradients, clip, and update.
 
-        The engine clips and steps at the accumulation boundary inside
-        ``forward_backward_batch``; unlike the FSDP engine there is no
+        Running the update here (not inside forward_backward_batch) preserves
+        veRL's split contract -- Tinker-style callers adjust the optimizer
+        between backward and step. Unlike the FSDP engine there is no
         non-finite-norm skip, matching AutoModel's own recipes.
         """
+        if not self._window_open:
+            raise RuntimeError("optimizer_step requires a preceding forward_backward_batch")
+        self._window_open = False
+        self.training_engine.step()
         grad_norm = self.training_engine.get_global_grad_norm()
         return grad_norm.item() if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
 
@@ -758,7 +784,11 @@ class AutomodelTrainModeCtx(BaseEngineCtx):
 
     def __exit__(self, exc_type, exc_value, traceback):
         assert isinstance(self.engine, AutomodelEngine)
-        if self.zero_grad_on_exit or exc_type is not None:
+        if exc_type is not None:
+            # Abandon any half-built accumulation window so recovery (e.g. after
+            # an OOM) can start a fresh one; this also clears gradients.
+            self.engine._reset_accumulation_window()
+        elif self.zero_grad_on_exit:
             self.engine.optimizer_zero_grad()
         super().__exit__(exc_type, exc_value, traceback)
 

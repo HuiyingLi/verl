@@ -33,6 +33,7 @@ class _RecordingTrainingEngine:
         self.gas_calls = []
         self.backward_calls = []
         self.step_calls = 0
+        self.reset_calls = 0
 
     def __call__(self, **model_inputs):
         return model_inputs["input_ids"].sum()
@@ -45,6 +46,12 @@ class _RecordingTrainingEngine:
 
     def step(self):
         self.step_calls += 1
+
+    def reset_accumulation(self):
+        self.reset_calls += 1
+
+    def get_global_grad_norm(self):
+        return torch.tensor(3.5)
 
 
 def _microbatch(token: int) -> TensorDict:
@@ -103,6 +110,7 @@ def test_forward_backward_drives_one_engine_microstep_per_microbatch(
 
     engine = object.__new__(AutomodelEngineWithLMHead)
     engine.training_engine = training_engine
+    engine._window_open = False
     engine.prepare_model_inputs = lambda micro_batch: (
         {"input_ids": micro_batch["token"].reshape(1, 1)},
         {},
@@ -145,12 +153,23 @@ def test_forward_backward_drives_one_engine_microstep_per_microbatch(
         assert training_engine.backward_calls == []
         assert training_engine.step_calls == 0
     else:
-        # One accumulation window per veRL mini-batch; every microbatch is one
-        # engine microstep with veRL's own normalization passed through raw.
+        # One accumulation window per veRL mini-batch; the boundary microstep is
+        # left pending so optimizer_step() can close it after Tinker-style
+        # optimizer adjustments.
         assert training_engine.gas_calls == [2]
         assert [loss.item() for loss, _ in training_engine.backward_calls] == pytest.approx([10.0, 13.0])
         assert all(scale_wrt_gas is False for _, scale_wrt_gas in training_engine.backward_calls)
+        assert training_engine.step_calls == 1
+        assert engine._window_open
+
+        with pytest.raises(NotImplementedError, match="one window per optimizer step"):
+            AutomodelEngine.forward_backward_batch(engine, data, loss_fn, forward_only=False)
+
+        assert AutomodelEngine.optimizer_step(engine) == 3.5
         assert training_engine.step_calls == 2
+        assert not engine._window_open
+        with pytest.raises(RuntimeError, match="requires a preceding forward_backward_batch"):
+            AutomodelEngine.optimizer_step(engine)
     assert [record["loss"] for record in outputs] == pytest.approx([10.0, 13.0])
     assert [("model_output" in record) for record in outputs] == [keeps_model_output, keeps_model_output]
     assert torch.equal(indices, torch.tensor([1, 0]))
@@ -175,7 +194,11 @@ def test_optimizer_and_scheduler_stay_on_their_owners():
 
     class TrainingEngine:
         def __init__(self):
+            self.step_calls = 0
             self.norm_reads = 0
+
+        def step(self):
+            self.step_calls += 1
 
         def get_global_grad_norm(self):
             self.norm_reads += 1
@@ -185,11 +208,13 @@ def test_optimizer_and_scheduler_stay_on_their_owners():
     engine.optimizer = Optimizer()
     engine.lr_scheduler = Scheduler()
     engine.training_engine = TrainingEngine()
+    engine._window_open = True
 
     AutomodelEngine.optimizer_zero_grad(engine)
     assert AutomodelEngine.optimizer_step(engine) == 3.5
     assert AutomodelEngine.lr_scheduler_step(engine) == 0.25
     assert engine.optimizer.zero_grad_calls == 1
+    assert engine.training_engine.step_calls == 1
     assert engine.training_engine.norm_reads == 1
     assert engine.lr_scheduler.increments == [1]
 
@@ -871,6 +896,7 @@ def test_forward_backward_batch_updates_parameters_through_a_real_engine(monkeyp
 
     engine = object.__new__(AutomodelEngineWithLMHead)
     engine.training_engine = Engine(model, optimizer=optimizer, max_grad_norm=1.0)
+    engine._window_open = False
     engine.prepare_model_inputs = lambda micro_batch: ({"input_ids": micro_batch["token"]}, {})
     engine.prepare_model_outputs = lambda raw_output, _args, _micro_batch: {"value": raw_output}
     engine.get_data_parallel_group = lambda: None
@@ -909,3 +935,35 @@ def test_forward_backward_batch_updates_parameters_through_a_real_engine(monkeyp
     assert not torch.equal(model.proj.weight.detach(), initial_weight)
     # The boundary already cleared gradients for the next window.
     assert all(p.grad is None for p in model.parameters())
+
+
+def test_failed_microstep_resets_the_engine_window(monkeypatch):
+    training_engine = _RecordingTrainingEngine()
+
+    engine = object.__new__(AutomodelEngineWithLMHead)
+    engine.training_engine = training_engine
+    engine._window_open = False
+    engine.prepare_model_inputs = lambda micro_batch: ({"input_ids": micro_batch["token"].reshape(1, 1)}, {})
+    engine.prepare_model_outputs = lambda raw_output, _args, _micro_batch: {"value": raw_output}
+    engine.get_data_parallel_group = lambda: None
+    engine.get_data_parallel_size = lambda: 1
+
+    microbatches = [_microbatch(2), _microbatch(5)]
+    data = TensorDict({"loss_mask": torch.ones(2)}, batch_size=[2])
+
+    monkeypatch.setattr(transformer_impl, "get_device_id", lambda: "cpu")
+    monkeypatch.setattr(transformer_impl, "get_device_name", lambda: "cpu")
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        transformer_impl, "prepare_micro_batches", lambda **kwargs: (microbatches, torch.tensor([0, 1]))
+    )
+
+    def failing_loss(model_output, data, dp_group):
+        raise RuntimeError("simulated OOM")
+
+    with pytest.raises(RuntimeError, match="simulated OOM"):
+        AutomodelEngine.forward_backward_batch(engine, data, failing_loss, forward_only=False)
+
+    # The failed window was abandoned, so the next one starts cleanly.
+    assert training_engine.reset_calls == 1
+    assert not engine._window_open
